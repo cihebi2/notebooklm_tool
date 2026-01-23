@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>晨间播客工厂 · NotebookLM Studio</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;600;800&family=Noto+Serif+SC:wght@600;800;900&family=Recursive:wght@400;600;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div class="brand">
+          <h1 class="title">晨间播客工厂</h1>
+          <p class="subtitle">
+            把 2 万字早报交给 NotebookLM：多账号轮询生成 · 自动验收时长 · 达标即下载 · 实时进度可视化
+          </p>
+        </div>
+        <div class="badgeRow">
+          <div class="badge">
+            <span id="statusDot" class="dot"></span>
+            <span>状态</span>
+            <strong id="statusLabel">idle</strong>
+          </div>
+          <div class="badge">
+            <span>任务</span>
+            <strong id="jobId">-</strong>
+          </div>
+        </div>
+      </header>
+
+      <div class="grid">
+        <section class="panel sticky">
+          <div class="panelHeader">
+            <h2>输入 / 报告</h2>
+            <div class="hint">字符数：<span id="charCount">0</span></div>
+          </div>
+          <div class="panelBody">
+            <div id="dropzone" class="drop" role="button" tabindex="0">
+              <div>
+                <strong>拖拽文件到这里</strong>
+                <div class="meta">或点击选择 .txt/.md（也支持直接粘贴到下方）</div>
+              </div>
+              <div style="text-align:right">
+                <div id="dropMeta" class="meta">未选择文件</div>
+                <a id="clearFile" class="meta" href="javascript:void(0)">清除文件</a>
+              </div>
+              <input id="filePicker" type="file" accept=".txt,.md,.text" hidden />
+            </div>
+
+            <div class="field" style="margin-top:12px">
+              <label>报告正文</label>
+              <textarea id="reportText" placeholder="把 ChatGPT 生成的早间新闻报告粘贴到这里…"></textarea>
+              <div class="hint">
+                提示：如果经常遇到“音频太短”，建议把提示词写得更硬一点（例如要求 45–55 分钟、章节结构、主持人节奏等）。
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panelHeader">
+            <h2>运行面板</h2>
+            <div class="hint">实时状态</div>
+          </div>
+          <div class="panelBody">
+            <div class="kv">
+              <div class="k">State</div>
+              <div class="v" id="jobState">-</div>
+              <div class="k">Success</div>
+              <div class="v" id="jobSuccess">0/ -</div>
+              <div class="k">Chars</div>
+              <div class="v" id="jobChars">-</div>
+            </div>
+
+            <div class="btnRow" style="margin-top:12px">
+              <button id="startBtn" class="btn primary">启动生成</button>
+              <button id="cancelBtn" class="btn danger">取消</button>
+            </div>
+
+            <div class="tabs" style="margin-top:12px">
+              <button class="tabBtn" type="button" data-tab="live">进度</button>
+              <button class="tabBtn" type="button" data-tab="files">文件</button>
+              <button class="tabBtn" type="button" data-tab="log">日志</button>
+              <button class="tabBtn" type="button" data-tab="queue">队列</button>
+            </div>
+
+            <div id="tab-live" class="field tabPane" style="margin-top:12px">
+              <label>当前进度</label>
+              <div id="progressSummary" class="progressSummary">
+                <div class="progressTop">
+                  <div id="progressText" class="progressText">-</div>
+                  <div id="progressSub" class="hint"></div>
+                </div>
+                <div class="progressBar">
+                  <div id="progressFill" class="progressFill"></div>
+                </div>
+              </div>
+
+              <div id="splitBoard" class="splitBoard" style="margin-top:10px"></div>
+              <div id="inflight" class="inflight" style="margin-top:10px"></div>
+
+              <div class="hint" style="margin-top:10px">账号实时状态</div>
+              <div id="live" class="live">
+                <div class="hint">等待任务开始…</div>
+              </div>
+            </div>
+
+            <div id="tab-log" class="field tabPane" style="margin-top:12px">
+              <label>进度日志</label>
+              <div class="row" style="align-items:center; justify-content:space-between; margin-bottom:8px">
+                <div class="hint">日志会随任务落盘保存，刷新/重启后也能查看。</div>
+                <a id="exportLogLink" class="btn ghost" href="#" target="_blank">导出日志</a>
+              </div>
+              <div id="log" class="log"></div>
+            </div>
+
+            <div id="tab-files" class="field tabPane" style="margin-top:12px">
+              <label>下载文件</label>
+              <div id="files" class="files">
+                <div class="hint">还没有下载文件。达标后会出现在这里。</div>
+              </div>
+            </div>
+
+            <div id="tab-queue" class="field tabPane" style="margin-top:12px">
+              <label>任务队列</label>
+              <div class="btnRow" style="margin-top:6px">
+                <button id="refreshJobsBtn" class="btn ghost" type="button">刷新列表</button>
+              </div>
+              <div id="jobs" class="jobs" style="margin-top:10px">
+                <div class="hint">加载中…</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panelHeader">
+            <h2>账号池</h2>
+            <div class="hint">每个账号一份 storage_state.json</div>
+          </div>
+          <div class="panelBody">
+            <div id="accountsList" class="accounts"></div>
+
+            <div style="margin-top:12px">
+              <div class="row">
+                <div class="field">
+                  <label>账号名称</label>
+                  <input id="accName" placeholder="例如：Gemini-Pro-01" />
+                </div>
+                <div class="field">
+                  <label>storage_state.json</label>
+                  <input id="accFile" type="file" accept=".json" />
+                </div>
+              </div>
+
+              <div class="row" style="margin-top:10px">
+                <div class="field">
+                  <label>登录浏览器</label>
+                  <select id="loginBrowser">
+                    <option value="edge" selected>Microsoft Edge（推荐）</option>
+                    <option value="chrome">Google Chrome</option>
+                    <option value="chromium">Playwright Chromium（独立窗口）</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>复用已登录 Profile（可选）</label>
+                  <select id="loginProfile">
+                    <option value="">临时 Profile（需要手动登录）</option>
+                  </select>
+                  <div class="hint" style="margin-top:6px">
+                    选择本机浏览器 Profile，可直接复用已有 Google 登录；如提示占用，请先关闭对应浏览器窗口再重试。
+                  </div>
+                </div>
+              </div>
+
+              <div class="btnRow" style="margin-top:10px">
+                <button id="addAccBtn" class="btn">添加账号</button>
+                <button id="importAccBtn" class="btn">从浏览器导入 Cookie（实验）</button>
+                <button id="loginAccBtn" class="btn">浏览器登录添加</button>
+              </div>
+
+              <div id="loginBox" class="loginBox" style="display:none; margin-top:10px">
+                <div class="loginTop">
+                  <div>
+                    <div class="loginTitle">浏览器登录进行中</div>
+                    <div id="loginStatus" class="hint">-</div>
+                  </div>
+                  <div class="btnRow">
+                    <button id="loginFinishBtn" class="btn primary">完成保存</button>
+                    <button id="loginCancelBtn" class="btn danger">取消</button>
+                  </div>
+                </div>
+                <div id="loginHint" class="hint" style="margin-top:8px">
+                  会弹出一个浏览器窗口：完成 Google 登录并确保打开 NotebookLM 首页，然后点“完成保存”。
+                </div>
+              </div>
+
+              <div class="hint" style="margin-top:10px">
+                三种方式添加账号：上传 storage_state.json（手动） / “从浏览器导入 Cookie”（实验：新版 Chrome/Edge 可能因 v20 加密失败） / “浏览器登录添加”（推荐）。
+                如自动登录失败，可在终端执行：
+                <span style="font-family:Recursive, ui-monospace, monospace"
+                  >notebooklm --storage /path/to/storage_state.json login</span
+                >
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panelHeader">
+            <h2>生成策略</h2>
+            <div class="hint">长度阈值 + 账号并发</div>
+          </div>
+          <div class="panelBody">
+            <div class="row">
+              <div class="field">
+                <label>目标条数</label>
+                <input id="targetCount" type="number" min="1" max="20" value="1" />
+              </div>
+              <div class="field">
+                <label>计数方式</label>
+                <select id="targetMode">
+                  <option value="accepted" selected>达标条数（>= 阈值才计数）</option>
+                  <option value="downloaded">生成条数（全部保留，供挑选）</option>
+                </select>
+                <div class="hint">选择“生成条数”可一次并行生成多条供挑选（会自动勾选保留短文件、关闭删除短 artifact）。</div>
+              </div>
+              <div class="field">
+                <label>验收时长（分钟）</label>
+                <input id="minMinutes" type="number" min="1" max="240" value="40" />
+              </div>
+            </div>
+
+            <div class="row" style="margin-top:10px">
+              <div class="field">
+                <label>分段拼接（应对“整段太短”）</label>
+                <label
+                  style="
+                    display: flex;
+                    gap: 8px;
+                    align-items: center;
+                    font-size: 12px;
+                    color: var(--muted);
+                    margin-top: 6px;
+                  "
+                >
+                  <input id="splitEnabled" type="checkbox" />
+                  启用：按 [01]…[30] 识别条目 → 拆成多段生成 → ffmpeg 拼接
+                </label>
+              </div>
+              <div class="field">
+                <label>分段数</label>
+                <input id="splitSegments" type="number" min="2" max="10" value="3" />
+              </div>
+              <div class="field">
+                <label>每段阈值（分钟）</label>
+                <input id="splitMinMinutes" type="number" min="1" max="120" value="15" />
+              </div>
+              <div class="field">
+                <label>Split Parallel</label>
+                <label
+                  style="
+                    display: flex;
+                    gap: 8px;
+                    align-items: center;
+                    font-size: 12px;
+                    color: var(--muted);
+                    margin-top: 6px;
+                  "
+                >
+                  <input id="splitParallel" type="checkbox" />
+                  Generate segments in parallel using multiple accounts (faster, but higher rate-limit risk)
+                </label>
+              </div>
+            </div>
+
+            <div class="row" style="margin-top:10px">
+              <div class="field">
+                <label>拼接输出</label>
+                <select id="splitOutputFormat">
+                  <option value="mp3" selected>MP3（推荐）</option>
+                  <option value="mp4">MP4</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>分段文件</label>
+                <label
+                  style="
+                    display: flex;
+                    gap: 8px;
+                    align-items: center;
+                    font-size: 12px;
+                    color: var(--muted);
+                    margin-top: 6px;
+                  "
+                >
+                  <input id="splitKeepParts" type="checkbox" />
+                  保留分段文件（调试用）
+                </label>
+              </div>
+              <div class="field">
+                <label>提示</label>
+                <div class="hint" style="margin-top:6px">
+                  如果识别不到条目，会自动按段落长度均分拆分。
+                </div>
+              </div>
+            </div>
+
+            <div class="row" style="margin-top:10px">
+              <div class="field">
+                <label>语言</label>
+                <select id="lang">
+                  <option value="zh" selected>中文 (zh)</option>
+                  <option value="en">English (en)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>默认长度</label>
+                <select id="audioLength">
+                  <option value="long" selected>LONG</option>
+                  <option value="default">DEFAULT</option>
+                  <option value="short">SHORT</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>播客风格</label>
+                <select id="audioFormat">
+                  <option value="deep_dive" selected>DEEP_DIVE</option>
+                  <option value="brief">BRIEF</option>
+                  <option value="critique">CRITIQUE</option>
+                  <option value="debate">DEBATE</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="row" style="margin-top:10px">
+              <div class="field">
+                <label>账号并发</label>
+                <input id="accConcurrency" type="number" min="1" max="20" value="2" />
+                <div class="hint">并发越高越容易触发限流；建议 1–2。</div>
+              </div>
+              <div class="field">
+                <label>单账号并行生成数</label>
+                <input id="perAccConcurrency" type="number" min="1" max="6" value="1" />
+                <div class="hint">单账号同时生成多少条音频（更快，但更容易限流）</div>
+              </div>
+              <div class="field">
+                <label>短音频处理</label>
+                <div style="display:flex; gap:12px; align-items:center; margin-top:6px">
+                  <label style="display:flex; gap:8px; align-items:center; font-size:12px; color:var(--muted)">
+                    <input id="keepShort" type="checkbox" />
+                    保留短文件
+                  </label>
+                  <label style="display:flex; gap:8px; align-items:center; font-size:12px; color:var(--muted)">
+                    <input id="deleteShort" type="checkbox" checked />
+                    删除短 artifact
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div class="row" style="margin-top:10px">
+              <div class="field">
+                <label>提示词方案</label>
+                <select id="promptPreset">
+                  <option value="custom" selected>自定义（本地保存）</option>
+                  <option value="liurun_podcast">刘润商业早新闻·生成播客（60min+）</option>
+                  <option value="morning_long">早间新闻·长播客（45–55min）</option>
+                  <option value="morning_split">早间新闻·分段（每段≈15min）</option>
+                </select>
+                <div class="hint">切换方案会覆盖下方提示词</div>
+              </div>
+              <div class="field">
+                <label>固定提示词</label>
+                <label
+                  style="
+                    display: flex;
+                    gap: 8px;
+                    align-items: center;
+                    font-size: 12px;
+                    color: var(--muted);
+                    margin-top: 6px;
+                  "
+                >
+                  <input id="useFixedInstructions" type="checkbox" checked />
+                  启用固定提示词（自动拼接到最前面）
+                </label>
+              </div>
+            </div>
+
+            <div class="row" style="margin-top:10px">
+              <div class="field">
+                <label>固定提示词名称</label>
+                <input id="promptName" placeholder="刘润商业早新闻 · 生成播客" />
+                <div class="hint">保存到服务器后，刷新/重启也会自动加载。</div>
+              </div>
+              <div class="field">
+                <label>提示词保存</label>
+                <div class="btnRow">
+                  <button id="savePromptBtn" class="btn">保存固定提示词</button>
+                  <button id="loadPromptBtn" class="btn ghost" type="button">加载已保存</button>
+                  <button id="resetPromptBtn" class="btn ghost" type="button">恢复内置模板</button>
+                </div>
+                <div id="promptSavedAt" class="hint" style="margin-top:6px"></div>
+              </div>
+            </div>
+
+            <div class="field" style="margin-top:10px">
+              <label>固定提示词（自动加入）</label>
+              <textarea
+                id="fixedInstructions"
+                placeholder="例如：请生成一段 45–55 分钟的晨间新闻播客。两位主持人对谈，按【宏观/科技/商业/社会/彩蛋】章节推进，每章开头给 1 句摘要，控制语速不要太快，避免跳读，保留引用来源线索。"
+                style="min-height:150px"
+              ></textarea>
+              <div class="hint">
+                建议把“结构/主持人/语速/禁忌/引用规则”等放这里；本次追加写在下面。
+                日期变量：<code>{{TODAY}}</code> / <code>{{TOMORROW}}</code> 会在生成时自动替换。
+              </div>
+              <div id="promptDatePreview" class="hint" style="margin-top:6px"></div>
+            </div>
+
+            <div class="field" style="margin-top:10px">
+              <label>本次追加提示词（可选）</label>
+              <textarea
+                id="instructions"
+                placeholder="可选：补充今天的特殊要求，例如强调某条新闻的讨论深度、口吻、节奏等…"
+                style="min-height:110px"
+              ></textarea>
+            </div>
+
+            <div class="field" style="margin-top:10px">
+              <label>提示词预览（已替换日期）</label>
+              <textarea id="promptPreview" readonly style="min-height:180px"></textarea>
+              <div class="hint">这是实际发送给 NotebookLM 的完整提示词（固定 + 追加）。</div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

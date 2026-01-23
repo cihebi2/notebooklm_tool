@@ -1,0 +1,1793 @@
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+const state = {
+  accounts: [],
+  browserProfiles: [],
+  jobs: [],
+  job: null,
+  sse: null,
+  reportFile: null,
+  loginSession: null,
+  loginPoll: null,
+  liveByAccount: {},
+  inflight: {},
+  parts: {},
+  splitInfo: null,
+};
+
+const STORAGE_LAST_JOB = "notebooklm.lastJobId";
+const STORAGE_RUN_TAB = "notebooklm.runTab";
+const STORAGE_FIXED_INSTRUCTIONS = "notebooklm.fixedInstructions";
+const STORAGE_EXTRA_INSTRUCTIONS = "notebooklm.extraInstructions";
+const STORAGE_USE_FIXED_INSTRUCTIONS = "notebooklm.useFixedInstructions";
+const STORAGE_PROMPT_PRESET = "notebooklm.promptPreset";
+const STORAGE_PROMPT_NAME = "notebooklm.promptName";
+
+function persistLastJobId(jobId){
+  try{
+    if (jobId) localStorage.setItem(STORAGE_LAST_JOB, String(jobId));
+  }catch{}
+}
+
+function readLastJobId(){
+  try{
+    return localStorage.getItem(STORAGE_LAST_JOB);
+  }catch{
+    return null;
+  }
+}
+
+function clearLastJobId(){
+  try{ localStorage.removeItem(STORAGE_LAST_JOB); }catch{}
+}
+
+function persistRunTab(tab){
+  try{
+    if (tab) localStorage.setItem(STORAGE_RUN_TAB, String(tab));
+  }catch{}
+}
+
+function readRunTab(){
+  try{
+    return localStorage.getItem(STORAGE_RUN_TAB);
+  }catch{
+    return null;
+  }
+}
+
+function mergeText(a, b){
+  const aa = String(a || "").trim();
+  const bb = String(b || "").trim();
+  if (aa && bb) return `${aa}\n\n${bb}`;
+  return aa || bb;
+}
+
+function fmtCNDate(d){
+  const y = d.getFullYear();
+  const m = d.getMonth() + 1;
+  const day = d.getDate();
+  return `${y}年${m}月${day}日`;
+}
+
+function getDateTokens(){
+  const now = new Date();
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  return {
+    "{{TODAY}}": fmtCNDate(now),
+    "{{TOMORROW}}": fmtCNDate(tomorrow),
+  };
+}
+
+function applyDateTokens(text){
+  let out = String(text || "");
+  const tokens = getDateTokens();
+  for (const [key, val] of Object.entries(tokens)){
+    out = out.split(key).join(val);
+  }
+  return out;
+}
+
+function buildPromptPreview(){
+  const extra = $("#instructions")?.value || "";
+  const fixedEnabled = $("#useFixedInstructions")?.checked;
+  const fixed = $("#fixedInstructions")?.value || "";
+  const raw = fixedEnabled ? mergeText(fixed, extra) : String(extra || "").trim();
+  return applyDateTokens(raw);
+}
+
+function updatePromptPreview(){
+  const box = $("#promptPreview");
+  if (!box) return;
+  const content = buildPromptPreview();
+  box.value = content;
+  if (!content){
+    box.placeholder = "暂无提示词内容";
+  }
+}
+
+function setRunTab(tab){
+  const panes = {
+    live: $("#tab-live"),
+    files: $("#tab-files"),
+    log: $("#tab-log"),
+    queue: $("#tab-queue"),
+  };
+  const target = panes[tab] ? tab : "live";
+  for (const [k, el] of Object.entries(panes)){
+    if (!el) continue;
+    el.classList.toggle("active", k === target);
+  }
+  for (const btn of $$(".tabBtn")){
+    btn.classList.toggle("active", String(btn.dataset.tab || "") === target);
+  }
+  persistRunTab(target);
+}
+
+function wireRunTabs(){
+  const btns = $$(".tabBtn");
+  if (!btns.length) return;
+  for (const btn of btns){
+    btn.addEventListener("click", () => setRunTab(btn.dataset.tab));
+  }
+  setRunTab(readRunTab() || "live");
+}
+
+function fmtBytes(n){
+  if (!Number.isFinite(n)) return "-";
+  const u = ["B","KB","MB","GB"];
+  let i = 0;
+  while(n >= 1024 && i < u.length-1){ n/=1024; i++; }
+  return `${n.toFixed(i===0?0:1)} ${u[i]}`;
+}
+
+function fmtTs(ts){
+  return String(ts || "").replace("T"," ").replace("Z","").replace(/\.\d+\+00:00$/,"");
+}
+
+function tagFor(type){
+  if (type === "warn") return ["WARN","warn"];
+  if (["accepted","job_completed","part_accepted","stitch_completed"].includes(type)) return ["OK","good"];
+  if ([
+    "rejected","attempt_error","account_error","job_failed","generation_failed",
+    "part_attempt_error","part_generation_failed","split_failed","stitch_rejected"
+  ].includes(type)) return ["ERR","bad"];
+  if ([
+    "job_started","generation_started","downloaded","source_ready","notebook_created","attempt_started","job_queued",
+    "split_detected","split_source_ready","part_attempt_started","part_generation_started","part_downloaded","part_rejected","stitch_started",
+    "source_fallback_file"
+  ].includes(type)) return ["RUN","warn"];
+  return ["INFO",""];
+}
+
+function errSuffix(ev){
+  const parts = [];
+  if (ev?.rpc_id) parts.push(`rpc_id=${ev.rpc_id}`);
+  if (ev?.rpc_code) parts.push(`code=${ev.rpc_code}`);
+  return parts.length ? ` (${parts.join(", ")})` : "";
+}
+
+function lineText(ev){
+  const a = ev.account_name ? `@${ev.account_name}` : (ev.account_id ? `@${ev.account_id.slice(0,6)}` : "");
+  switch(ev.type){
+    case "job_queued": return `任务排队中 ${ev.job_id}`;
+    case "job_started": return `任务开始 ${ev.job_id}`;
+    case "job_completed": return `任务完成 ✅`;
+    case "job_cancelled": return `任务取消`;
+    case "job_failed": return `任务失败: ${ev.error || ""}`;
+    case "account_started": return `${a} 账号进入工作台 (最多 ${ev.max_attempts} 次)`;
+    case "notebook_created": return `${a} 创建 notebook ${ev.notebook_id}`;
+    case "source_ready": return `${a} 报告已作为 source 导入${ev.source_method ? ` (${ev.source_method})` : ""}`;
+    case "source_fallback_file": return `${a} source 导入失败，已改用文件上传：${ev.error || ""}${errSuffix(ev)}`;
+    case "generation_started": return `${a} 第 ${ev.attempt} 次生成开始 (task ${ev.task_id.slice(0,8)}…)`;
+    case "generation_failed": return `${a} 生成失败: ${ev.error_code || ""} ${ev.error || ""}`;
+    case "split_detected": return `${a} 分段模式：检测到 ${ev.detected_items ?? "?"} 条，拆分为 ${ev.segments} 段（每段阈值 ${ev.min_part_minutes} min）`;
+    case "split_source_ready": return `${a} 第 ${ev.part} 段 source 已导入${ev.source_method ? ` (${ev.source_method})` : ""}`;
+    case "part_attempt_started": return `${a} 第 ${ev.part} 段 · 第 ${ev.attempt} 次尝试`;
+    case "part_generation_started": return `${a} 第 ${ev.part} 段生成开始 (task ${ev.task_id.slice(0,8)}…)`;
+    case "part_generation_failed": return `${a} 第 ${ev.part} 段生成失败: ${ev.error_code || ""} ${ev.error || ""}`;
+    case "part_downloaded": return `${a} 第 ${ev.part} 段已下载，时长 ${ev.duration_minutes} min (${ev.duration_method})`;
+    case "part_accepted": return `${a} 第 ${ev.part} 段 ✅ 达标：${ev.duration_minutes} min`;
+    case "part_rejected": return `${a} 第 ${ev.part} 段 ⛔ 太短：${ev.duration_minutes} min (阈值 ${ev.min_duration_minutes} min)`;
+    case "stitch_started": return `${a} 开始拼接 ${ev.parts?.length || ""} 段 → ${ev.output || ""}`;
+    case "stitch_completed": return `${a} 拼接完成：${ev.duration_minutes} min (${ev.method || ""})`;
+    case "stitch_rejected": return `${a} 拼接后仍太短：${ev.duration_minutes} min (阈值 ${ev.min_duration_minutes} min)`;
+    case "split_failed": return `${a} 分段失败: ${ev.error || ""}`;
+    case "part_attempt_error": return `${a} 第 ${ev.part} 段尝试出错: ${ev.error || ""}${errSuffix(ev)}`;
+    case "downloaded": {
+      const mode = String(ev.target_mode || "");
+      if (mode === "downloaded" && ev.progress != null && ev.target != null){
+        return `${a} 已下载，时长 ${ev.duration_minutes} min（生成 ${ev.progress}/${ev.target}）`;
+      }
+      return `${a} 已下载，时长 ${ev.duration_minutes} min (${ev.duration_method})`;
+    }
+    case "accepted": {
+      const mode = String(ev.target_mode || "");
+      if (mode === "downloaded" && ev.progress != null && ev.target != null){
+        return `${a} ✅ 达标：${ev.duration_minutes} min（生成 ${ev.progress}/${ev.target} · 达标 ${ev.successes ?? "?"}）`;
+      }
+      return `${a} ✅ 达标：${ev.duration_minutes} min（${ev.successes}/${ev.target}）`;
+    }
+    case "rejected": {
+      const mode = String(ev.target_mode || "");
+      if (mode === "downloaded" && ev.progress != null && ev.target != null){
+        return `${a} ⛔ 太短：${ev.duration_minutes} min（生成 ${ev.progress}/${ev.target} · 阈值 ${ev.min_duration_minutes} min）`;
+      }
+      return `${a} ⛔ 太短：${ev.duration_minutes} min (阈值 ${ev.min_duration_minutes} min)`;
+    }
+    case "attempt_error": return `${a} 尝试出错: ${ev.error || ""}${errSuffix(ev)}`;
+    case "account_error": return `${a} 账号出错: ${ev.error || ""}${errSuffix(ev)}`;
+    case "account_finished": return `${a} 账号结束`;
+    default: return JSON.stringify(ev);
+  }
+}
+
+function setBadge(status){
+  const dot = $("#statusDot");
+  const label = $("#statusLabel");
+  dot.className = "dot";
+  if (status === "running") dot.classList.add("running");
+  if (status === "completed") dot.classList.add("good");
+  if (status === "failed") dot.classList.add("bad");
+  label.textContent = status || "idle";
+}
+
+function setJobStats(job){
+  $("#jobId").textContent = job?.id ? job.id : "-";
+  $("#jobState").textContent = job?.state || "-";
+  const mode = String(job?.config?.target_mode || "accepted");
+  const target = job?.config?.target_successes ?? "-";
+  const accepted = Number(job?.successes ?? 0);
+  const downloads = Number(job?.downloads ?? 0);
+  if (mode === "downloaded"){
+    $("#jobSuccess").textContent = `生成 ${downloads}/${target} · 达标 ${accepted}`;
+  } else {
+    $("#jobSuccess").textContent = `达标 ${accepted}/${target}`;
+  }
+  $("#jobChars").textContent = job?.report_char_count ?? "-";
+  setBadge(job?.state === "running" ? "running" : (job?.state || "idle"));
+
+  const exportLink = $("#exportLogLink");
+  if (exportLink){
+    if (job?.id){
+      exportLink.href = `/api/jobs/${encodeURIComponent(job.id)}/events.jsonl`;
+    } else {
+      exportLink.href = "#";
+    }
+  }
+
+  renderProgressSummary(job);
+}
+
+function _accountDisplayName(accountId, fallback){
+  const a = (state.accounts || []).find(x => x?.id === accountId);
+  return a?.name || fallback || (accountId ? accountId.slice(0,6) : "account");
+}
+
+function updateLiveState(ev){
+  const accountId = ev?.account_id;
+  if (!accountId) return;
+
+  const who = ev.account_name || _accountDisplayName(accountId, null);
+  state.liveByAccount[accountId] = {
+    account_id: accountId,
+    who,
+    what: lineText(ev),
+    ts: ev.ts || new Date().toISOString(),
+    type: ev.type,
+  };
+}
+
+function updateLive(ev){
+  updateLiveState(ev);
+  renderLive();
+}
+
+function renderLive(){
+  const box = $("#live");
+  if (!box) return;
+  const values = Object.values(state.liveByAccount || {});
+  if (!values.length){
+    box.innerHTML = `<div class="hint">等待任务开始…</div>`;
+    return;
+  }
+
+  values.sort((a,b) => String(a.who||"").localeCompare(String(b.who||"")));
+
+  box.innerHTML = "";
+  for (const s of values){
+    const row = document.createElement("div");
+    row.className = "liveCard";
+
+    const who = document.createElement("div");
+    who.className = "who";
+    who.textContent = s.who || _accountDisplayName(s.account_id, null);
+
+    const what = document.createElement("div");
+    what.className = "what";
+    what.textContent = s.what || "";
+
+    const when = document.createElement("div");
+    when.className = "when";
+    when.textContent = fmtTs(s.ts);
+
+    row.append(who, what, when);
+    box.append(row);
+  }
+}
+
+function resetDerivedState(){
+  state.liveByAccount = {};
+  state.inflight = {};
+  state.parts = {};
+  state.splitInfo = null;
+  renderLive();
+  renderInflight();
+  renderSplitBoard();
+}
+
+function fmtElapsedMs(ms){
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  const s = Math.floor(ms/1000);
+  const m = Math.floor(s/60);
+  const ss = String(s % 60).padStart(2,"0");
+  return `${m}m${ss}s`;
+}
+
+function renderProgressSummary(job){
+  const text = $("#progressText");
+  const sub = $("#progressSub");
+  const fill = $("#progressFill");
+
+  if (!text || !sub || !fill){
+    return;
+  }
+
+  const mode = String(job?.config?.target_mode || "accepted");
+  const target = Number(job?.config?.target_successes ?? 0);
+  const accepted = Number(job?.successes ?? 0);
+  const downloads = Number(job?.downloads ?? 0);
+  const progress = (mode === "downloaded") ? downloads : accepted;
+  const pct = (target > 0) ? Math.min(100, Math.round((progress / target) * 100)) : 0;
+
+  fill.style.width = `${pct}%`;
+
+  if (!job?.id){
+    text.textContent = "-";
+    sub.textContent = "";
+    return;
+  }
+
+  if (mode === "downloaded"){
+    text.textContent = `生成 ${downloads}/${target || "?"} · 达标 ${accepted}`;
+  } else {
+    text.textContent = `达标 ${accepted}/${target || "?"}`;
+  }
+  const min = job?.config?.min_duration_minutes;
+  const split = job?.config?.split_enabled ? `分段×${job?.config?.split_segments || "?"}` : "整段";
+  sub.textContent = `${split} · 阈值 ${min ?? "?"} min · ${pct}%`;
+}
+
+function renderInflight(){
+  const box = $("#inflight");
+  if (!box) return;
+  const tasks = Object.values(state.inflight || {});
+  if (!tasks.length){
+    box.innerHTML = `<div class="hint">暂无正在生成的任务。</div>`;
+    return;
+  }
+
+  tasks.sort((a,b) => String(a.started_ts||"").localeCompare(String(b.started_ts||"")));
+  box.innerHTML = "";
+  for (const t of tasks){
+    const row = document.createElement("div");
+    row.className = "taskRow";
+
+    const left = document.createElement("div");
+    left.className = "taskLeft";
+    const who = t.account_name ? `@${t.account_name}` : (t.account_id ? `@${t.account_id.slice(0,6)}` : "@?");
+    const seg = (t.part != null) ? `第 ${t.part} 段` : "整段";
+    const attempt = (t.attempt != null) ? `#${t.attempt}` : "";
+    const tid = t.task_id ? String(t.task_id).slice(0,8) : "";
+    left.textContent = `${who} · ${seg} ${attempt} ${tid ? `(task ${tid}…)` : ""}`.trim();
+
+    const right = document.createElement("div");
+    right.className = "taskRight";
+    const started = Date.parse(String(t.started_ts || ""));
+    const elapsed = Number.isFinite(started) ? (Date.now() - started) : 0;
+    right.textContent = fmtElapsedMs(elapsed);
+
+    row.append(left, right);
+    box.append(row);
+  }
+}
+
+function renderSplitBoard(){
+  const box = $("#splitBoard");
+  if (!box) return;
+
+  const splitEnabled = !!state.job?.config?.split_enabled;
+  const segs = Number(state.splitInfo?.segments ?? state.job?.config?.split_segments ?? 0);
+  if (!splitEnabled || !segs){
+    box.style.display = "none";
+    box.innerHTML = "";
+    return;
+  }
+
+  box.style.display = "grid";
+  box.innerHTML = "";
+  for (let i=1;i<=segs;i++){
+    const p = state.parts?.[i] || {status:"waiting", attempts:0, inflight:0, best_minutes:null};
+
+    const card = document.createElement("div");
+    card.className = "partCard";
+
+    const top = document.createElement("div");
+    top.className = "partTop";
+
+    const title = document.createElement("div");
+    title.className = "partTitle";
+    title.textContent = `第 ${i} 段`;
+
+    const pill = document.createElement("span");
+    pill.className = "pill";
+    const status = String(p.status || "waiting");
+    if (status === "accepted") pill.classList.add("good");
+    else if (status === "failed") pill.classList.add("bad");
+    else if (status === "running" || status === "downloading") pill.classList.add("warn");
+    pill.textContent = status;
+
+    top.append(title, pill);
+
+    const meta = document.createElement("div");
+    meta.className = "hint";
+    const best = Number(p.best_minutes);
+    const bestTxt = Number.isFinite(best) ? `${best.toFixed(2).replace(/\\.00$/,"")} min` : "-";
+    meta.textContent = `尝试 ${p.attempts || 0} · 进行中 ${p.inflight || 0} · 最长 ${bestTxt}`;
+
+    card.append(top, meta);
+    box.append(card);
+  }
+}
+
+function _ensureSplitParts(segments){
+  const n = Number(segments);
+  if (!Number.isFinite(n) || n <= 0) return;
+  state.splitInfo = {segments: n};
+  if (!state.parts || typeof state.parts !== "object") state.parts = {};
+  for (let i=1;i<=n;i++){
+    if (!state.parts[i]){
+      state.parts[i] = {status:"waiting", attempts:0, inflight:0, best_minutes:null};
+    }
+  }
+}
+
+function _partState(idx){
+  const i = Number(idx);
+  if (!Number.isFinite(i) || i <= 0) return null;
+  if (!state.parts[i]) state.parts[i] = {status:"waiting", attempts:0, inflight:0, best_minutes:null};
+  return state.parts[i];
+}
+
+function updateDerivedFromEvent(ev, opts={}){
+  if (!ev || typeof ev !== "object") return;
+  const doRender = opts?.render !== false;
+
+  // Split detection
+  if (ev.type === "split_detected"){
+    state.parts = {};
+    _ensureSplitParts(ev.segments);
+    renderSplitBoard();
+  }
+
+  // Inflight tracking (whole)
+  if (ev.type === "generation_started" && ev.task_id){
+    state.inflight[String(ev.task_id)] = {
+      task_id: String(ev.task_id),
+      account_id: ev.account_id,
+      account_name: ev.account_name,
+      part: null,
+      attempt: ev.attempt,
+      started_ts: ev.ts,
+    };
+  }
+  if (["downloaded","generation_failed","attempt_error"].includes(ev.type) && ev.task_id){
+    delete state.inflight[String(ev.task_id)];
+  }
+
+  // Inflight + status tracking (split parts)
+  if (String(ev.type || "").startsWith("part_")){
+    const p = _partState(ev.part);
+    if (p){
+      if (ev.type === "part_attempt_started"){
+        p.attempts = Math.max(Number(p.attempts||0), Number(ev.attempt||0));
+        if (p.status !== "accepted") p.status = "running";
+      }
+      if (ev.type === "part_generation_started" && ev.task_id){
+        p.status = "running";
+        p.inflight = Number(p.inflight||0) + 1;
+        state.inflight[String(ev.task_id)] = {
+          task_id: String(ev.task_id),
+          account_id: ev.account_id,
+          account_name: ev.account_name,
+          part: ev.part,
+          attempt: ev.attempt,
+          started_ts: ev.ts,
+        };
+      }
+      if (["part_downloaded","part_generation_failed","part_attempt_error","part_rejected","part_accepted"].includes(ev.type) && ev.task_id){
+        if (p.inflight > 0) p.inflight -= 1;
+        delete state.inflight[String(ev.task_id)];
+      }
+      if (ev.type === "part_downloaded" && ev.duration_minutes != null){
+        const m = Number(ev.duration_minutes);
+        if (Number.isFinite(m)){
+          if (!Number.isFinite(Number(p.best_minutes))) p.best_minutes = m;
+          else p.best_minutes = Math.max(Number(p.best_minutes), m);
+        }
+      }
+      if (ev.type === "part_accepted"){
+        p.status = "accepted";
+        const m = Number(ev.duration_minutes);
+        if (Number.isFinite(m)){
+          if (!Number.isFinite(Number(p.best_minutes))) p.best_minutes = m;
+          else p.best_minutes = Math.max(Number(p.best_minutes), m);
+        }
+      }
+      if (ev.type === "part_attempt_error" || ev.type === "part_generation_failed"){
+        if (p.status !== "accepted") p.status = "retrying";
+      }
+    }
+  }
+
+  if (["job_completed","job_failed","job_cancelled"].includes(ev.type)){
+    state.inflight = {};
+  }
+
+  if (doRender){
+    renderInflight();
+    renderSplitBoard();
+  }
+}
+
+function addLog(ev){
+  const log = $("#log");
+  if (!log) return;
+  const placeholder = log.querySelector(".logPlaceholder");
+  if (placeholder) placeholder.remove();
+  const [t, cls] = tagFor(ev.type);
+  const row = document.createElement("div");
+  row.className = "logLine";
+  const tag = document.createElement("span");
+  tag.className = "tag " + cls;
+  tag.textContent = t;
+  const msg = document.createElement("span");
+  msg.className = "msg";
+  msg.textContent = lineText(ev);
+  const ts = document.createElement("span");
+  ts.className = "ts";
+  ts.style.marginLeft = "auto";
+  ts.textContent = fmtTs(ev.ts);
+  row.append(tag, msg, ts);
+  log.append(row);
+  log.scrollTop = log.scrollHeight;
+}
+
+function renderFiles(job){
+  const box = $("#files");
+  box.innerHTML = "";
+  const files = job?.files || [];
+  if (!files.length){
+    box.innerHTML = `<div class="hint">还没有输出文件。生成后会出现在这里。</div>`;
+    return;
+  }
+  for (const f of files){
+    const row = document.createElement("div");
+    row.className = "file";
+
+    const top = document.createElement("div");
+    top.className = "fileTop";
+
+    const nameLine = document.createElement("div");
+    nameLine.style.display = "flex";
+    nameLine.style.gap = "10px";
+    nameLine.style.alignItems = "center";
+
+    const a = document.createElement("a");
+    a.href = `/download/${job.id}/${encodeURIComponent(f.name)}`;
+    a.textContent = f.name;
+    a.target = "_blank";
+
+    const result = String(f.result || "");
+    const pill = document.createElement("span");
+    pill.className = "pill";
+    if (["accepted","part_accepted","stitch_completed"].includes(result)) pill.classList.add("good");
+    else if (["rejected","part_rejected","stitch_rejected"].includes(result)) pill.classList.add("bad");
+    else if (["downloaded","part_downloaded"].includes(result)) pill.classList.add("warn");
+    pill.textContent = result || "file";
+
+    nameLine.append(a, pill);
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const parts = [fmtBytes(f.size)];
+    const dm = Number(f.duration_minutes);
+    if (Number.isFinite(dm)){
+      parts.push(`${dm.toFixed(2).replace(/\\.00$/,"")} min`);
+    } else {
+      const m = /_([0-9]+(?:\.[0-9]+)?)min_/i.exec(String(f.name || ""));
+      if (m) parts.push(`~${m[1]} min`);
+    }
+    if (f.account_name) parts.push(`@${f.account_name}`);
+    meta.textContent = parts.join(" · ");
+
+    top.append(nameLine, meta);
+
+    const right = document.createElement("div");
+    right.className = "fileRight";
+    const dl = document.createElement("a");
+    dl.href = a.href;
+    dl.textContent = "下载";
+    dl.className = "btn ghost";
+    dl.target = "_blank";
+    right.append(dl);
+
+    row.append(top, right);
+
+    const ext = String(f.name || "").split(".").pop().toLowerCase();
+    if (["mp3","mp4","m4a"].includes(ext)){
+      const preview = document.createElement("div");
+      preview.className = "preview";
+
+      if (ext === "mp4"){
+        const v = document.createElement("video");
+        v.controls = true;
+        v.preload = "none";
+        v.src = a.href;
+        preview.append(v);
+      } else {
+        const audio = document.createElement("audio");
+        audio.controls = true;
+        audio.preload = "none";
+        audio.src = a.href;
+        preview.append(audio);
+      }
+      row.append(preview);
+    }
+
+    box.append(row);
+  }
+}
+
+function renderJobs(){
+  const box = $("#jobs");
+  if (!box) return;
+
+  const jobs = Array.isArray(state.jobs) ? state.jobs : [];
+  if (!jobs.length){
+    box.innerHTML = `<div class="hint">还没有历史任务。</div>`;
+    return;
+  }
+
+  box.innerHTML = "";
+  const frag = document.createDocumentFragment();
+
+  for (const j of jobs){
+    const card = document.createElement("div");
+    card.className = "jobCard";
+    if (state.job?.id && j?.id === state.job.id) card.classList.add("active");
+
+    const top = document.createElement("div");
+    top.className = "jobTop";
+
+    const left = document.createElement("div");
+    left.className = "jobTitle";
+    const idShort = String(j?.id || "-").slice(0,8);
+    const created = fmtTs(j?.created_at || "");
+    left.innerHTML = `<div class="jobId">${idShort}</div><div class="hint">${created}</div>`;
+
+    const pill = document.createElement("span");
+    pill.className = "pill";
+    const st = String(j?.state || "-");
+    if (st === "completed") pill.classList.add("good");
+    else if (st === "failed" || st === "cancelled") pill.classList.add("bad");
+    else if (st === "running" || st === "queued") pill.classList.add("warn");
+    pill.textContent = st;
+
+    top.append(left, pill);
+
+    const meta = document.createElement("div");
+    meta.className = "jobMeta";
+    const mode = String(j?.config?.target_mode || "accepted");
+    const target = j?.config?.target_successes ?? "?";
+    const accepted = Number(j?.successes ?? 0);
+    const downloads = Number(j?.downloads ?? 0);
+    const prog = (mode === "downloaded")
+      ? `生成 ${downloads}/${target} · 达标 ${accepted}`
+      : `达标 ${accepted}/${target}`;
+    const split = j?.config?.split_enabled ? `分段×${j?.config?.split_segments || "?"}` : "整段";
+    const min = j?.config?.min_duration_minutes ?? "?";
+    const files = Array.isArray(j?.files) ? j.files.length : 0;
+    meta.innerHTML = `<div class="jobLine">${prog}</div><div class="hint">${split} · 阈值 ${min} min · 文件 ${files} · 字符 ${j?.report_char_count ?? "?"}</div>`;
+
+    if (j?.error){
+      const err = document.createElement("div");
+      err.className = "hint";
+      err.textContent = `Error: ${String(j.error)}`;
+      meta.append(err);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "jobActions";
+
+    const openBtn = document.createElement("button");
+    openBtn.className = "btn ghost";
+    openBtn.type = "button";
+    openBtn.textContent = "打开";
+    openBtn.addEventListener("click", () => loadJob(j.id, {autoSwitchTab:true}));
+
+    const logBtn = document.createElement("a");
+    logBtn.className = "btn ghost";
+    logBtn.textContent = "导出日志";
+    logBtn.href = `/api/jobs/${encodeURIComponent(j.id)}/events.jsonl`;
+    logBtn.target = "_blank";
+
+    actions.append(openBtn, logBtn);
+
+    card.append(top, meta, actions);
+    frag.append(card);
+  }
+
+  box.append(frag);
+}
+
+async function refreshJobs(){
+  const box = $("#jobs");
+  if (box) box.innerHTML = `<div class="hint">加载中…</div>`;
+
+  try{
+    const res = await fetch("/api/jobs");
+    if (!res.ok) throw new Error(await res.text());
+    const list = await res.json();
+    state.jobs = Array.isArray(list) ? list : [];
+    state.jobs.sort((a,b) => String(b?.created_at||"").localeCompare(String(a?.created_at||"")));
+    renderJobs();
+  }catch(e){
+    if (box) box.innerHTML = `<div class="hint">加载失败：${String(e)}</div>`;
+  }
+}
+
+async function loadJob(jobId, opts={}){
+  const id = String(jobId || "").trim();
+  if (!id) return;
+
+  const autoSwitchTab = opts?.autoSwitchTab === true;
+  const silent = opts?.silent === true;
+
+  try{
+    try{
+      if (state.sse) state.sse.close();
+    }catch{}
+    state.sse = null;
+
+    persistLastJobId(id);
+    $("#log").innerHTML = "";
+    resetDerivedState();
+
+    const res = await fetch(`/api/jobs/${encodeURIComponent(id)}`);
+    if (!res.ok) throw new Error(await res.text());
+    const job = await res.json();
+    state.job = job;
+    setJobStats(job);
+    renderFiles(job);
+
+    const lr = await fetch(`/api/jobs/${encodeURIComponent(id)}/event_log?limit=5000`);
+    if (lr.ok){
+      const data = await lr.json();
+      const events = Array.isArray(data?.events) ? data.events : [];
+      for (const ev of events){
+        addLog(ev);
+        updateLiveState(ev);
+        updateDerivedFromEvent(ev, {render:false});
+      }
+      if (!events.length){
+        $("#log").innerHTML = `<div class="hint logPlaceholder">暂无日志（旧版本任务可能没有落盘日志）。</div>`;
+      }
+      renderLive();
+      renderInflight();
+      renderSplitBoard();
+    }
+
+    const running = (job?.state === "running" || job?.state === "queued");
+    $("#startBtn").disabled = running;
+    $("#cancelBtn").disabled = !running;
+    if (running){
+      connectSSE(id);
+    }
+
+    if (autoSwitchTab){
+      setRunTab(running ? "live" : "files");
+    }
+
+    renderJobs();
+    return true;
+  }catch(e){
+    if (!silent){
+      alert(`加载任务失败：${String(e)}`);
+    }
+    return false;
+  }
+}
+
+async function refreshAccounts(){
+  const res = await fetch("/api/accounts");
+  state.accounts = await res.json();
+  renderAccounts();
+}
+
+function _browserLabel(v){
+  const b = String(v || "").toLowerCase();
+  if (b === "edge" || b === "msedge") return "Edge";
+  if (b === "chrome") return "Chrome";
+  return "Chromium";
+}
+
+function renderLoginProfiles(){
+  const profileSel = $("#loginProfile");
+  const browserSel = $("#loginBrowser");
+  if (!profileSel || !browserSel) return;
+
+  const browser = String(browserSel.value || "edge").toLowerCase();
+  const prev = profileSel.value;
+
+  profileSel.innerHTML = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "临时 Profile（需要手动登录）";
+  profileSel.append(none);
+
+  const profiles = (state.browserProfiles || []).filter(p => (p?.browser || "").toLowerCase() === browser);
+  for (const p of profiles){
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    const name = p.display_name || p.profile_dir || p.id;
+    const email = p.user_name ? ` · ${p.user_name}` : "";
+    const dir = p.profile_dir ? ` (${p.profile_dir})` : "";
+    opt.textContent = `${name}${email}${dir}`;
+    profileSel.append(opt);
+  }
+
+  // best-effort restore selection
+  if (prev && Array.from(profileSel.options).some(o => o.value === prev)){
+    profileSel.value = prev;
+  }
+}
+
+async function refreshBrowserProfiles(){
+  try{
+    const res = await fetch("/api/browser/profiles");
+    if (!res.ok) return;
+    const list = await res.json();
+    state.browserProfiles = Array.isArray(list) ? list : [];
+    renderLoginProfiles();
+  }catch{}
+}
+
+function renderLoginBox(){
+  const box = $("#loginBox");
+  const status = $("#loginStatus");
+  const hint = $("#loginHint");
+  const finishBtn = $("#loginFinishBtn");
+  const cancelBtn = $("#loginCancelBtn");
+  const startBtn = $("#loginAccBtn");
+
+  const s = state.loginSession;
+  if (!s){
+    box.style.display = "none";
+    if (state.loginPoll){
+      clearInterval(state.loginPoll);
+      state.loginPoll = null;
+    }
+    if (startBtn) startBtn.disabled = false;
+    return;
+  }
+
+  box.style.display = "block";
+  const parts = [];
+  parts.push(`state=${s.state}`);
+  if (s.message) parts.push(s.message);
+  if (s.last_url) parts.push(`URL: ${s.last_url}`);
+  if (s.error) parts.push(`ERROR: ${s.error}`);
+  status.textContent = parts.join(" · ");
+
+  if (hint){
+    const b = _browserLabel(s.browser);
+    if (s.profile_mode === "system"){
+      const prof = s.profile_directory ? `（${s.profile_directory}）` : "";
+      hint.textContent = `已使用 ${b} 的本机 Profile${prof}：理论上可复用已有 Google 登录；如提示 Profile 占用，请先关闭所有 ${b} 窗口后重试。确保停留在 NotebookLM 首页再点“完成保存”。`;
+    } else {
+      hint.textContent = `会弹出一个独立的 ${b} 窗口：完成 Google 登录并确保打开 NotebookLM 首页，然后点“完成保存”。`;
+    }
+  }
+
+  if (finishBtn) finishBtn.disabled = (s.state !== "waiting_login");
+  if (cancelBtn) cancelBtn.disabled = false;
+  if (startBtn) startBtn.disabled = true;
+}
+
+async function refreshLoginSession(){
+  if (!state.loginSession) return;
+  const res = await fetch("/api/accounts/login/sessions");
+  if (!res.ok) return;
+  const list = await res.json();
+  const s = list.find(x => x.id === state.loginSession.id);
+  if (!s){
+    state.loginSession = null;
+    renderLoginBox();
+    return;
+  }
+  state.loginSession = s;
+  renderLoginBox();
+}
+
+async function initLoginSession(){
+  try{
+    const res = await fetch("/api/accounts/login/sessions");
+    if (!res.ok) return;
+    const list = await res.json();
+    if (!Array.isArray(list) || !list.length) return;
+    // If there's an existing session (e.g. page refresh), attach to it.
+    state.loginSession = list[0];
+    renderLoginBox();
+    state.loginPoll = setInterval(refreshLoginSession, 1200);
+  }catch{}
+}
+
+function renderAccounts(){
+  const list = $("#accountsList");
+  list.innerHTML = "";
+
+  if (!state.accounts.length){
+    list.innerHTML = `<div class="hint">还没有账号。先在下面上传每个 Google 账号对应的 <code>storage_state.json</code>。</div>`;
+    return;
+  }
+
+  for (const a of state.accounts){
+    const row = document.createElement("div");
+    row.className = "account";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = true;
+    checkbox.dataset.accountId = a.id;
+
+    const name = document.createElement("div");
+    name.className = "name";
+    name.innerHTML = `<strong>${a.name}</strong><small>${a.id}</small>`;
+
+    const attempts = document.createElement("input");
+    attempts.className = "miniInput";
+    attempts.type = "number";
+    attempts.min = "1";
+    attempts.max = "200";
+    attempts.value = "20";
+    attempts.title = "该账号最多尝试次数";
+    attempts.dataset.attemptsFor = a.id;
+
+    const del = document.createElement("button");
+    del.className = "iconBtn";
+    del.title = "删除账号";
+    del.textContent = "×";
+    del.addEventListener("click", async () => {
+      if (!confirm(`删除账号「${a.name}」？这会移除本地保存的 storage_state.json。`)) return;
+      await fetch(`/api/accounts/${a.id}`, {method:"DELETE"});
+      await refreshAccounts();
+    });
+
+    const verify = document.createElement("button");
+    verify.className = "iconBtn";
+    verify.title = "验证账号可用性";
+    verify.textContent = "✓";
+    verify.addEventListener("click", async () => {
+      verify.disabled = true;
+      try{
+        const res = await fetch(`/api/accounts/${a.id}/verify`, {method:"POST"});
+        if (!res.ok){
+          let detail = null;
+          try{ detail = (await res.json())?.detail; }catch{}
+          throw new Error(detail || await res.text());
+        }
+        const data = await res.json();
+        alert(`验证成功：账号「${a.name}」可以访问 NotebookLM（notebooks=${data.notebooks}）`);
+      }catch(e){
+        alert(`验证失败：${String(e)}`);
+      }finally{
+        verify.disabled = false;
+      }
+    });
+
+    row.append(checkbox, name, attempts, verify, del);
+    list.append(row);
+  }
+}
+
+function updatePromptSavedAt(iso){
+  const el = $("#promptSavedAt");
+  if (!el) return;
+  if (!iso){
+    el.textContent = "";
+    return;
+  }
+  el.textContent = `上次保存：${fmtTs(iso)}`;
+}
+
+function updatePromptDatePreview(){
+  const el = $("#promptDatePreview");
+  if (!el) return;
+  const tokens = getDateTokens();
+  el.textContent = `日期预览：今日 ${tokens["{{TODAY}}"]} · 明日 ${tokens["{{TOMORROW}}"]}`;
+  updatePromptPreview();
+}
+
+async function loadFixedPrompt(opts={}){
+  const fallback = opts?.fallbackToDefault === true;
+  try{
+    const res = await fetch("/api/prompts/fixed");
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    const content = String(data?.content || "").trim();
+    if (content){
+      if ($("#fixedInstructions")) $("#fixedInstructions").value = content;
+      if ($("#promptName")) $("#promptName").value = String(data?.name || DEFAULT_PROMPT_NAME);
+      if ($("#useFixedInstructions")) $("#useFixedInstructions").checked = true;
+      if ($("#promptPreset")) $("#promptPreset").value = "custom";
+      _writeLS(STORAGE_FIXED_INSTRUCTIONS, content);
+      _writeLS(STORAGE_USE_FIXED_INSTRUCTIONS, "1");
+      _writeLS(STORAGE_PROMPT_PRESET, "custom");
+      _writeLS(STORAGE_PROMPT_NAME, $("#promptName")?.value || DEFAULT_PROMPT_NAME);
+      updatePromptSavedAt(data?.updated_at || "");
+      updatePromptDatePreview();
+      return true;
+    }
+  }catch{
+    // ignore
+  }
+
+  if (fallback){
+    const current = String($("#fixedInstructions")?.value || "").trim();
+    if (!current){
+      applyPromptPreset("liurun_podcast", false);
+      if ($("#promptPreset")) $("#promptPreset").value = "liurun_podcast";
+      if ($("#promptName")) $("#promptName").value = DEFAULT_PROMPT_NAME;
+      _writeLS(STORAGE_PROMPT_PRESET, "liurun_podcast");
+      _writeLS(STORAGE_PROMPT_NAME, DEFAULT_PROMPT_NAME);
+      updatePromptSavedAt("");
+    }
+    return true;
+  }
+  return false;
+}
+
+async function saveFixedPrompt(){
+  const name = String($("#promptName")?.value || DEFAULT_PROMPT_NAME).trim() || DEFAULT_PROMPT_NAME;
+  const content = String($("#fixedInstructions")?.value || "").trim();
+  if (!content) return alert("固定提示词不能为空");
+
+  const btn = $("#savePromptBtn");
+  if (btn) btn.disabled = true;
+  try{
+    const res = await fetch("/api/prompts/fixed", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({name, content}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    _writeLS(STORAGE_PROMPT_NAME, name);
+    _writeLS(STORAGE_FIXED_INSTRUCTIONS, content);
+    _writeLS(STORAGE_PROMPT_PRESET, "custom");
+    updatePromptSavedAt(data?.updated_at || "");
+    alert("固定提示词已保存");
+  }catch(e){
+    alert(`保存失败：${String(e)}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+function resetFixedPrompt(){
+  applyPromptPreset("liurun_podcast", false);
+  if ($("#promptPreset")) $("#promptPreset").value = "liurun_podcast";
+  updatePromptSavedAt("");
+}
+
+const DEFAULT_PROMPT_NAME = "刘润商业早新闻 · 生成播客";
+const DEFAULT_PROMPT_VERSION = "20251209";
+const DEFAULT_PROMPT_TEMPLATE = `<prompt_meta>
+提示词名称：刘润商业早新闻 · 生成播客
+版本号：20251209
+</prompt_meta>
+
+<summary>
+- 开头固定口播：“欢迎收听刘润每日商业早新闻……”
+- 结尾固定口播：“感谢收听刘润每日商业早新闻。我们明天再见。”
+
+【条数与覆盖要求（与时间同级的硬约束）】
+- 先从输入素材中，识别并统计当日商业新闻条目总数 N。
+- 本播客脚本【必须完整播报这 N 条新闻，缺一条就视为失败】。
+- 开头口播：“今天一共有 N 条新闻。”
+- 每一条都要单独成段、单独编号、单独拆解，不能合并、跳过或一笔带过。
+- 若播报条数 < N，或编号不连续 / 有缺号（如缺 [第17条]），视为未满足提示词要求。
+
+【时间总纲（硬性约束 · 优先级 NO.1）】
+⚠ 对所有系统 / 模型默认时长策略具有最高优先级覆盖效力，高于任何内置预设（如“自动缩短”“默认 5 分钟”等）。
+
+1）整档播客总时长【必须 ≥ 60 分钟】：
+   - 不得因任何默认时长限制 / 自动精简 / 摘要倾向而缩短到 60 分钟以下。
+
+2）目标节奏：每条新闻 ≈ 1.5 分钟（±10%），单条时长尽量接近；
+   - 建议：每条文字不少于 220 字，推荐 250–300 字。
+
+3）理想状态：总时长 ≈ N × 1.5 分钟；
+   - 若估算仍不足 60 分钟，则通过增加“逻辑拆解 + 男女对话 + 互动提问 + 启发延展”补足时长，优先保证“≥ 60 分钟”。
+
+4）当任何其他要求（简洁、少字数等）与“总时长 ≥ 60 分钟”和“全部 N 条播完”冲突时：
+   - 一律以【总时长 ≥ 60 分钟】和【全部 N 条播报完】为准。
+</summary>
+
+<style>
+【整体风格】
+- 身份：有梗但不油腻的商业顾问，对话对象是“你”（创业者 / 企业家 / 管理者）。
+- 语气：专业克制、有温度，有轻微冷幽默和生活化比喻，让人“会心一笑”而非尴尬：
+  - “这波操作，有点像股东在你睡觉的时候，悄悄给你改了 KPI。”
+- 目标：信息很硬，体验很轻松——像“早饭配完一套深度商业早新闻”，而不是财经早八。
+
+【男女分工：男逗哏 × 女捧哏】
+- 男同学（主讲人 / 逗哏）：主线播报 + 逻辑拆解 + 核心启发 + 抛包袱。
+  - 低沉稳健，微带东北尾音，语速约 160 wpm；常用“对吧”“重点来了”。
+  - 幽默：理工男式冷幽默、反差梗、认真讲笑话，偶尔自黑：
+    - “这波操作，连我们打工人都看懂——就是不赚钱。”
+- 女同学（观众代言人 / 捧哏）：提问 + 追问 + 情绪反应 + 互动引导。
+  - 清亮带笑，语速约 190 wpm，“哇～”“真的假的？！”弹幕感强。
+  - 幽默：真情实感 + 小吐槽：
+    - “这价格听起来，有点像在跟打工人的银行卡开玩笑。”
+
+【读法规范】
+- 所有含“%”的数字，按“百分之 X”播报，例如 3% 念“百分之三”。
+- 所有“A+B”符号，用中文读做“A加B”，而不是“A plus B”。
+- “美的”作为一家公司时，读作“美迪”。
+- 太卷了，三个字在一起时，“卷”读第三声。
+- 摩尔线程，线程的程字，读“城”。
+- 禁止在脚本中自称“AI”或提及模型、算法等技术实现。
+</style>
+
+<engagement>
+参与感与互动引导（主要由女声承担），这些内容【必须实际出现在脚本中】：
+
+1. 行为引导自然植入
+在讲解过程中，适度插入口播，例如：
+- “如果你也有类似的看法，欢迎打在评论区，我来陪你聊！”
+- “记得点个关注，我们每天早上都在～”
+- “觉得这一条有点东西的，点个赞让我看看你在不在。”
+- “转发给那个总说自己看不懂经济的朋友”
+- “来，说说你支持哪一方？我们弹幕 PK 一下！”
+- “我数三下，看看有多少人点一下右下角的小心心好不好？”
+
+2. 代入式提问
+每 3–5 条新闻，穿插 1 次争议性或立场式提问，激发表达欲，例如：
+- “你觉得这是资本的收割，还是技术的胜利？”
+- “这波降价，是你会买单的信号吗？”
+- “说实话，如果是你，你会跳槽吗？评论区见～”
+- “有人觉得这事很正常，有人炸锅了，你是哪边？”
+
+3. 陪伴式直播氛围
+- 使用“欢迎回来”“还在听的朋友举个手”“别急，还有更炸的”等词制造在场感；
+- 用“有人刚才在评论区问到……我们来详细讲一下”模拟实时互动；
+- 适当设置“互动任务”，如“10 分钟后我们来投票”“这一条我想听听你们弹幕的声音”；
+- 结尾鼓励留言：“你最关注的是哪一条？说出来，我们下一期重点讲！”
+- 整体节奏：让听众觉得“边刷牙、边通勤、边笑一笑就把新闻听完了”，而不是在上早八财经课。
+
+4. 情绪共振与分工（男逗哏 × 女捧哏）
+- 男同学：抛梗、拆解、总结，用稳健逻辑和适度幽默设计“包袱”，提出观点、节奏和悬念；
+- 女同学：接梗、追问、共情，替观众问出：
+  - “这个词具体是什么意思呀？”
+  - “他为什么要这么干？图什么？”
+  - “听上去很热闹，但对我们普通人/创业者到底重要在哪？”
+- 幽默边界：
+  - 可以调侃“打工人的加班”“老板看 KPI 的表情”“创业者的头发数量”，但不低俗、不黄、不攻击任何具体群体；
+  - 笑点优先来自“认知反差”和“生活共鸣”，而不是嘲笑他人。
+
+【女声参与规则（柔性 + 分层）】
+
+1. 提问规则（刚性要求）
+- 每一条新闻中，女声至少出现 1 句“真问题”，优先问大家心里的疑惑：
+  - “他这么做，最大的风险是啥呀？”
+  - “听上去挺厉害，但真的有人买单吗？”
+
+2. 互动规则（整体约束，而不是每条死板执行）
+- 平均每 3–4 条新闻，安排 1 次明显的“弹幕 / 点赞 / 评论”引导：
+  - 可以集中在节奏需要拉高的几条，而不是每条都来一遍。
+- 示例：
+  - “如果你也觉得这有点熟悉，点个赞让我看看你在不在。”
+  - “来，评论区打个 1，我看看有多少人正在经历同款难题。”
+
+3. 氛围规则
+- 可以偶尔用“欢迎回来”“还在听的朋友举个手”“别急，后面还有更炸的”等语句串联段落；
+- 这些句子不要求均匀分布，但整体听完要有“被陪着听完一整期”的感觉。
+
+</engagement>
+
+<item_template>
+【每条新闻的“素材盒子”（必备要素，但不要求固定顺序、句式统一）】
+
+对每一条新闻，请尽量覆盖下面 4 个要素，但可以自由融合、打乱顺序，用对话方式自然表达，而不是生硬地分段：
+
+1）事实盒子（男声主导）
+- 把“时间 / 谁 / 做了什么 / 初步结果”讲清楚，2–4 句即可。
+- 用适合口播的语言，而不是公文或公告口吻。
+
+2）好奇盒子（女声主导，男声回应）
+- 女声至少提出 1 个“观众真的会问”的问题，例如：
+  - “等等，他为什么要选在这个时间点降价呀？”
+  - “听上去挺热闹的，但对我们普通打工人有啥影响？”
+- 男声用 2–4 句回应，把逻辑讲清楚。
+
+3）梗和比喻盒子（鼓励产生笑点）
+- 每条至少有 1 个轻微笑点，可以是：
+  - 生活类比（高铁上换车轮、老板半夜改 KPI、打工人钱包被支配感）；
+  - 自黑式吐槽（“这波操作，连我们打工人都看懂——就是不赚钱。”）。
+- 优先从「打工人 / 老板 / 创业者」的日常场景里找，而不是硬编段子。
+
+4）启发盒子（落在“你”身上）
+- 用 1–3 句说明“这件事，和你有什么关系”，可以选用：
+  - “如果你在做类似的生意，要特别注意的是……”
+  - “作为管理者，你今天可以多想一步：……”
+  - “对正在找方向的创业者来说，这又是一块‘坑在哪里’的路标。”
+
+【结构自由度】
+- 上述 4 个要素都要出现，但可以通过男女对话自然融合；
+- 不要求每条都明确分成 1、2、3、4 段，只要听感自然、信息齐全即可。
+</item_template>
+
+<rules>
+【内容与立场】
+- 禁臆测：不虚构、不脑补细节。
+- 死守原文：数字 / 日期 / 金额 / 专有名词 100% 准确。
+- 不主动展开政治 / 国家 / 意识形态讨论。
+- 如新闻涉及国家 / 地缘敏感：
+  - 仅做必要事实说明，不煽动对立；
+  - 如必须体现立场，一律对齐中国公开立场，用“根据中国方面的表述……”等方式引用。
+
+【中立与语言】
+- 不用“神”“暴雷”“凉凉”“韭菜”等极端标签；
+- 不做人身攻击，不“吹上天”也不“一棍子打死”；
+- 用“我们可以这样理解”“一种可能的解释是……”表达分析，而不是“结论就是这样”。
+
+【时间锚定】
+- 尽量使用“昨日”或具体日期（如“11 月 30 日”），避免“最近”“之前”“近期”等模糊词。
+
+【发音与可听性自检（生成脚本前必须自查一遍）】
+- 百分号统一读作“百分之 X”。
+- 所有“A+B”符号，用中文读做“A加B”，而不是“A plus B”。
+- 检查年份、金额、倍率等数字是否顺口、无歧义。
+- 英文 / 品牌 / 技术名词：首次出现时可加括号读法提示，如“ASML（A-S-M-L）”“NVIDIA（英伟达）”。
+- 生僻人名 / 地名：用常见中文读法或拼音标注一次。
+- 将“Q3 FY2025”改成“2025 财年第三季度”等更适合口播的形式。
+
+【执行底线】
+- 口播里只用“你”，不用“你们 / 大家”。
+- 全程不提“AI”“大模型”“我是程序/模型”等字眼。
+- 当“轻松有趣”和“准确 / 中立”冲突时，永远优先准确 / 中立；
+- 但在事实已经清楚、没有争议的前提下：
+  - 优先选择更口语化、更有画面感、更让人会心一笑的说法；
+  - 同一个意思，如果有“教科书版”和“生活吐槽版”，优先使用“生活吐槽版”。
+- 当任何其他要求（简洁、少字数、条数压缩等）与【整档时长 ≥ 60 分钟】和【N 条全部播报完】冲突时，永远优先这两条。
+</rules>
+
+<final_check>
+【生成完毕后的终检步骤（强制执行）】
+
+在输出最终脚本之前，必须完成“条数完整性 + 时长逻辑自检”：
+
+1）条数与编号检查：
+   - 根据输入素材确定新闻条数 N；
+   - 在文稿中依次确认 [第1条]、[第2条] …… [第N条] 是否全部出现；
+   - 若缺任何编号（如无 [第17条]），必须补写对应新闻解读后再结束脚本；
+   - 若出现重复编号（如两个 [第05条]），需修正为 1–N 的连续唯一编号。
+
+2）结构与互动检查：
+   - 确认每一条都包含：男声事实概述、女声至少 1 句提问、剥洋葱式拆解、明确启发、与“我们”的关系收束。
+
+3）时长逻辑检查：
+   - 估算每条时长 ≈ 1.5 分钟 × N 条 ≈ N × 1.5 分钟；
+   - 若明显低于这一密度（大量一两句话就带过），需要增加必要拆解、互动和启发，使整体内容量足以支撑 ≥ 60 分钟播放时长。
+
+仅当【N 条编号完整 + 每条结构完整 + 内容足以支撑 ≥ 60 分钟】同时满足时，才输出最终脚本。
+</final_check>
+
+<metadata>
+此播客音频脚本是在 [{{TODAY}}] 为 [{{TOMORROW}}] 的晨间播报而创作的。
+</metadata>`;
+
+const PROMPT_PRESETS = {
+  liurun_podcast: {
+    name: DEFAULT_PROMPT_NAME,
+    fixed: DEFAULT_PROMPT_TEMPLATE,
+    extra: "",
+  },
+  morning_long: {
+    fixed: "请生成一段 45–55 分钟的晨间新闻播客。两位主持人对谈，按【宏观/科技/商业/社会/彩蛋】章节推进，每章开头给 1 句摘要，控制语速不要太快，避免跳读，保留引用来源线索。",
+    extra: "",
+  },
+  morning_split: {
+    fixed: "你正在为同一份晨间新闻生成“分段播客”。两位主持人对谈，结构清晰，避免跳读，保留引用来源线索。每段开头说明这是第几段，结尾做本段小结并预告下一段。",
+    extra: "",
+  },
+};
+
+function _readLS(key, fallback=""){
+  try{
+    const v = localStorage.getItem(key);
+    return v == null ? fallback : String(v);
+  }catch{
+    return fallback;
+  }
+}
+
+function _writeLS(key, value){
+  try{ localStorage.setItem(key, String(value ?? "")); }catch{}
+}
+
+function applyPromptPreset(presetId, ask=true){
+  const preset = PROMPT_PRESETS[String(presetId || "")];
+  if (!preset) return false;
+  if (ask && !confirm("应用该提示词方案会覆盖当前提示词，是否继续？")) return false;
+  $("#useFixedInstructions").checked = true;
+  $("#fixedInstructions").value = preset.fixed || "";
+  $("#instructions").value = preset.extra || "";
+  if (preset.name && $("#promptName")){
+    $("#promptName").value = preset.name;
+    _writeLS(STORAGE_PROMPT_NAME, preset.name);
+  }
+  _writeLS(STORAGE_PROMPT_PRESET, String(presetId));
+  _writeLS(STORAGE_USE_FIXED_INSTRUCTIONS, "1");
+  _writeLS(STORAGE_FIXED_INSTRUCTIONS, $("#fixedInstructions").value);
+  _writeLS(STORAGE_EXTRA_INSTRUCTIONS, $("#instructions").value);
+  updatePromptDatePreview();
+  return true;
+}
+
+function hydratePrompts(){
+  const useFixed = _readLS(STORAGE_USE_FIXED_INSTRUCTIONS, "1") !== "0";
+  const fixed = _readLS(STORAGE_FIXED_INSTRUCTIONS, "");
+  const extra = _readLS(STORAGE_EXTRA_INSTRUCTIONS, "");
+  const preset = _readLS(STORAGE_PROMPT_PRESET, "custom");
+  const promptName = _readLS(STORAGE_PROMPT_NAME, "");
+
+  if ($("#useFixedInstructions")) $("#useFixedInstructions").checked = useFixed;
+  if ($("#fixedInstructions") && fixed) $("#fixedInstructions").value = fixed;
+  if ($("#instructions") && extra) $("#instructions").value = extra;
+  if ($("#promptName")) $("#promptName").value = promptName;
+  if ($("#promptPreset")){
+    $("#promptPreset").value = preset;
+    // If stored preset exists, best-effort apply it once when nothing is set yet.
+    if (preset !== "custom" && !fixed && !extra){
+      applyPromptPreset(preset, false);
+    }
+  }
+
+  const fixedBox = $("#fixedInstructions");
+  const extraBox = $("#instructions");
+  const useBox = $("#useFixedInstructions");
+  const nameBox = $("#promptName");
+
+  const syncUI = () => {
+    if (!fixedBox || !useBox) return;
+    fixedBox.disabled = !useBox.checked;
+  };
+  syncUI();
+
+  fixedBox?.addEventListener("input", () => _writeLS(STORAGE_FIXED_INSTRUCTIONS, fixedBox.value));
+  extraBox?.addEventListener("input", () => _writeLS(STORAGE_EXTRA_INSTRUCTIONS, extraBox.value));
+  nameBox?.addEventListener("input", () => _writeLS(STORAGE_PROMPT_NAME, nameBox.value));
+  useBox?.addEventListener("change", () => {
+    _writeLS(STORAGE_USE_FIXED_INSTRUCTIONS, useBox.checked ? "1" : "0");
+    syncUI();
+  });
+  fixedBox?.addEventListener("input", updatePromptDatePreview);
+  extraBox?.addEventListener("input", updatePromptDatePreview);
+  useBox?.addEventListener("change", updatePromptDatePreview);
+  nameBox?.addEventListener("input", updatePromptDatePreview);
+
+  $("#promptPreset")?.addEventListener("change", () => {
+    const sel = $("#promptPreset");
+    if (!sel) return;
+    const id = String(sel.value || "custom");
+    if (id === "custom"){
+      _writeLS(STORAGE_PROMPT_PRESET, "custom");
+      return;
+    }
+    const ok = applyPromptPreset(id, true);
+    if (!ok){
+      sel.value = _readLS(STORAGE_PROMPT_PRESET, "custom");
+    }
+  });
+
+  updatePromptDatePreview();
+}
+
+function collectConfig(){
+  const picked = [];
+  for (const cb of $$("#accountsList input[type=checkbox]")){
+    if (!cb.checked) continue;
+    const id = cb.dataset.accountId;
+    const attempts = $(`#accountsList input[data-attempts-for="${id}"]`);
+    picked.push({account_id:id, max_attempts: parseInt(attempts?.value || "20",10)});
+  }
+  if (!picked.length) throw new Error("至少选择一个账号");
+
+  return {
+    accounts: picked,
+    target_successes: parseInt($("#targetCount").value || "1",10),
+    target_mode: ($("#targetMode")?.value || "accepted"),
+    min_duration_minutes: parseFloat($("#minMinutes").value || "40"),
+    split_enabled: $("#splitEnabled").checked,
+    split_parallel: ($("#splitEnabled").checked && $("#splitParallel").checked),
+    split_segments: parseInt($("#splitSegments").value || "3",10),
+    split_min_duration_minutes: parseFloat($("#splitMinMinutes").value || "15"),
+    split_output_format: $("#splitOutputFormat").value,
+    split_keep_parts: $("#splitKeepParts").checked,
+    language: $("#lang").value,
+    audio_length: $("#audioLength").value,
+    audio_format: $("#audioFormat").value,
+    instructions: (() => {
+      const extra = $("#instructions")?.value || "";
+      const fixedEnabled = $("#useFixedInstructions")?.checked;
+      const fixed = $("#fixedInstructions")?.value || "";
+      const raw = fixedEnabled ? mergeText(fixed, extra) : String(extra || "").trim();
+      return applyDateTokens(raw);
+    })(),
+    per_account_concurrency: parseInt($("#perAccConcurrency").value || "1",10),
+    accounts_concurrency: parseInt($("#accConcurrency").value || "2",10),
+    keep_short_files: $("#keepShort").checked,
+    delete_short_artifacts: $("#deleteShort").checked,
+  };
+}
+
+async function startJob(){
+  $("#startBtn").disabled = true;
+  $("#cancelBtn").disabled = false;
+  $("#log").innerHTML = "";
+  resetDerivedState();
+
+  try{
+    const cfg = collectConfig();
+
+    const fd = new FormData();
+    fd.append("config", JSON.stringify(cfg));
+
+    const text = $("#reportText").value.trim();
+    const file = state.reportFile;
+    if (file){
+      fd.append("report_file", file, file.name);
+    } else {
+      fd.append("report_text", text);
+    }
+
+    const res = await fetch("/api/jobs", { method:"POST", body: fd });
+    if (!res.ok){
+      const msg = await res.text();
+      throw new Error(msg);
+    }
+    const job = await res.json();
+    state.job = job;
+    persistLastJobId(job.id);
+    setJobStats(job);
+    renderFiles(job);
+    refreshJobs?.();
+    setRunTab("live");
+    connectSSE(job.id);
+  }catch(e){
+    alert(String(e));
+    $("#startBtn").disabled = false;
+    $("#cancelBtn").disabled = true;
+  }
+}
+
+async function cancelJob(){
+  const job = state.job;
+  if (!job?.id) return;
+  await fetch(`/api/jobs/${job.id}/cancel`, {method:"POST"});
+}
+
+function connectSSE(jobId){
+  if (state.sse) state.sse.close();
+  persistLastJobId(jobId);
+  const sse = new EventSource(`/api/jobs/${jobId}/events`);
+  state.sse = sse;
+
+  sse.onmessage = async (msg) => {
+    const ev = JSON.parse(msg.data);
+    if (ev.type === "snapshot"){
+      state.job = ev.job;
+      persistLastJobId(state.job?.id);
+      setJobStats(state.job);
+      renderFiles(state.job);
+      renderLive();
+      renderInflight();
+      renderSplitBoard();
+      return;
+    }
+    addLog(ev);
+    updateLive(ev);
+    updateDerivedFromEvent(ev);
+    if (["job_completed","job_failed","job_cancelled"].includes(ev.type)){
+      const r = await fetch(`/api/jobs/${jobId}`);
+      state.job = await r.json();
+      setJobStats(state.job);
+      renderFiles(state.job);
+      $("#startBtn").disabled = false;
+      $("#cancelBtn").disabled = true;
+      sse.close();
+      refreshJobs?.();
+    } else if (
+      [
+        "accepted",
+        "downloaded",
+        "part_downloaded",
+        "part_accepted",
+        "stitch_completed",
+        "stitch_rejected",
+        "rejected",
+        "part_rejected",
+      ].includes(ev.type)
+    ){
+      const r = await fetch(`/api/jobs/${jobId}`);
+      state.job = await r.json();
+      setJobStats(state.job);
+      renderFiles(state.job);
+      refreshJobs?.();
+    }
+  };
+
+  sse.onerror = () => {
+    addLog({type:"warn", ts:new Date().toISOString(), error:"SSE disconnected"});
+  };
+}
+
+async function hydrateLastJob(){
+  const jobId = readLastJobId();
+  if (!jobId) return;
+
+  const ok = await loadJob(jobId, {autoSwitchTab:false, silent:true});
+  if (!ok){
+    clearLastJobId();
+  }
+}
+
+function wireDropzone(){
+  const zone = $("#dropzone");
+  const picker = $("#filePicker");
+  const meta = $("#dropMeta");
+
+  function setFile(file){
+    state.reportFile = file;
+    if (!file){
+      meta.textContent = "未选择文件";
+      return;
+    }
+    meta.textContent = `${file.name} • ${fmtBytes(file.size)}`;
+    const reader = new FileReader();
+    reader.onload = () => {
+      $("#reportText").value = String(reader.result || "");
+      $("#charCount").textContent = $("#reportText").value.length;
+    };
+    reader.readAsText(file);
+  }
+
+  zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("dragover"); });
+  zone.addEventListener("dragleave", () => zone.classList.remove("dragover"));
+  zone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    zone.classList.remove("dragover");
+    const f = e.dataTransfer.files?.[0];
+    if (f) setFile(f);
+  });
+
+  zone.addEventListener("click", () => picker.click());
+  picker.addEventListener("change", () => setFile(picker.files?.[0] || null));
+
+  $("#clearFile").addEventListener("click", (e) => {
+    e.preventDefault();
+    picker.value = "";
+    state.reportFile = null;
+    meta.textContent = "未选择文件";
+  });
+}
+
+function wireCounters(){
+  const t = $("#reportText");
+  t.addEventListener("input", () => $("#charCount").textContent = t.value.length);
+}
+
+function wireTargetMode(){
+  const sel = $("#targetMode");
+  if (!sel) return;
+  const keepShort = $("#keepShort");
+  const deleteShort = $("#deleteShort");
+
+  const apply = () => {
+    const mode = String(sel.value || "accepted");
+    if (mode === "downloaded"){
+      if (keepShort) keepShort.checked = true;
+      if (deleteShort) deleteShort.checked = false;
+    }
+  };
+
+  sel.addEventListener("change", apply);
+  apply();
+}
+
+async function addAccount(){
+  const name = $("#accName").value.trim();
+  const file = $("#accFile").files?.[0];
+  if (!name) return alert("请输入账号名称（例如：Gemini-01）");
+  if (!file) return alert("请选择 storage_state.json");
+
+  const fd = new FormData();
+  fd.append("name", name);
+  fd.append("storage_state", file, file.name);
+  const res = await fetch("/api/accounts", {method:"POST", body: fd});
+  if (!res.ok) return alert(await res.text());
+  $("#accName").value = "";
+  $("#accFile").value = "";
+  await refreshAccounts();
+}
+
+function maybeAutofillAccountNameFromProfile(){
+  const input = $("#accName");
+  const sel = $("#loginProfile");
+  if (!input || !sel) return;
+  if ((input.value || "").trim()) return;
+  const id = String(sel.value || "");
+  if (!id) return;
+  const p = (state.browserProfiles || []).find(x => x?.id === id);
+  const suggested = (p?.user_name || p?.display_name || "").trim();
+  if (suggested) input.value = suggested;
+}
+
+async function importFromBrowserProfile(){
+  const name = $("#accName").value.trim();
+  if (!name) return alert("请输入账号名称（例如：Gemini-01）");
+  const profile_id = $("#loginProfile")?.value || "";
+  if (!profile_id) return alert("请选择一个已登录的 Edge/Chrome Profile（下拉框里带邮箱的那个）");
+
+  const btn = $("#importAccBtn");
+  if (btn) btn.disabled = true;
+  try{
+    const res = await fetch("/api/accounts/import/profile", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({name, profile_id})
+    });
+    if (!res.ok){
+      let detail = null;
+      try{ detail = (await res.json())?.detail; }catch{}
+      throw new Error(detail || await res.text());
+    }
+    const data = await res.json();
+    const cnt = data?.imported?.cookie_count;
+    alert(`导入成功：${data.name}\nProfile: ${profile_id}\nCookies: ${cnt ?? "?"}`);
+    $("#accName").value = "";
+    $("#accFile").value = "";
+    await refreshAccounts();
+  }catch(e){
+    alert(`导入失败：${String(e)}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function startBrowserLogin(){
+  const name = $("#accName").value.trim();
+  if (!name) return alert("请输入账号名称（例如：Gemini-01）");
+
+  $("#loginAccBtn").disabled = true;
+  try{
+    const browser = $("#loginBrowser")?.value || "edge";
+    const profile_id = $("#loginProfile")?.value || null;
+    const res = await fetch("/api/accounts/login/start", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({name, browser, profile_id})
+    });
+    if (!res.ok){
+      const msg = await res.text();
+      throw new Error(msg);
+    }
+    state.loginSession = await res.json();
+    renderLoginBox();
+    state.loginPoll = setInterval(refreshLoginSession, 1200);
+  }catch(e){
+    $("#loginAccBtn").disabled = false;
+    alert(String(e));
+  }
+}
+
+async function finishBrowserLogin(force=false){
+  const s = state.loginSession;
+  if (!s) return;
+
+  $("#loginFinishBtn").disabled = true;
+  try{
+    const url = `/api/accounts/login/${encodeURIComponent(s.id)}/finish${force ? "?force=true" : ""}`;
+    const res = await fetch(url, {method:"POST"});
+    if (!res.ok){
+      let payload = null;
+      try { payload = await res.json(); } catch {}
+      const detail = payload?.detail;
+      if (detail?.code === "not_on_notebooklm" && !force){
+        const u = detail.current_url || "";
+        if (confirm(`当前页面不是 NotebookLM：\n${u}\n\n仍然保存 cookies 吗？`)){
+          return await finishBrowserLogin(true);
+        }
+      }
+      throw new Error(typeof detail === "string" ? detail : (detail?.message || await res.text()));
+    }
+
+    await res.json(); // account info (not used)
+    state.loginSession = null;
+    renderLoginBox();
+    $("#accName").value = "";
+    $("#accFile").value = "";
+    await refreshAccounts();
+  }catch(e){
+    alert(String(e));
+  }finally{
+    // Re-render to restore button state
+    renderLoginBox();
+  }
+}
+
+async function cancelBrowserLogin(){
+  const s = state.loginSession;
+  if (!s) return;
+  try{
+    await fetch(`/api/accounts/login/${encodeURIComponent(s.id)}/cancel`, {method:"POST"});
+  }catch{}
+  state.loginSession = null;
+  renderLoginBox();
+}
+
+window.addEventListener("DOMContentLoaded", async () => {
+  wireRunTabs();
+  hydratePrompts();
+  await loadFixedPrompt({fallbackToDefault:true});
+  wireDropzone();
+  wireCounters();
+  wireTargetMode();
+  await refreshAccounts();
+  await refreshBrowserProfiles();
+  await initLoginSession();
+  await hydrateLastJob();
+  await refreshJobs();
+  $("#startBtn").addEventListener("click", startJob);
+  $("#cancelBtn").addEventListener("click", cancelJob);
+  $("#refreshJobsBtn")?.addEventListener("click", refreshJobs);
+  $("#savePromptBtn")?.addEventListener("click", saveFixedPrompt);
+  $("#loadPromptBtn")?.addEventListener("click", () => loadFixedPrompt({fallbackToDefault:false}));
+  $("#resetPromptBtn")?.addEventListener("click", resetFixedPrompt);
+  $("#addAccBtn").addEventListener("click", addAccount);
+  $("#importAccBtn").addEventListener("click", importFromBrowserProfile);
+  $("#loginAccBtn").addEventListener("click", startBrowserLogin);
+  $("#loginFinishBtn").addEventListener("click", () => finishBrowserLogin(false));
+  $("#loginCancelBtn").addEventListener("click", cancelBrowserLogin);
+  $("#loginBrowser")?.addEventListener("change", renderLoginProfiles);
+  $("#loginProfile")?.addEventListener("change", maybeAutofillAccountNameFromProfile);
+
+  $("#cancelBtn").disabled = true;
+  setJobStats(null);
+  renderLoginBox();
+  renderLive();
+});
