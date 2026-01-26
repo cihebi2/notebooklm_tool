@@ -10,6 +10,7 @@ const state = {
   reportFile: null,
   loginSession: null,
   loginPoll: null,
+  uiTimer: null,
   liveByAccount: {},
   inflight: {},
   parts: {},
@@ -23,6 +24,8 @@ const STORAGE_EXTRA_INSTRUCTIONS = "notebooklm.extraInstructions";
 const STORAGE_USE_FIXED_INSTRUCTIONS = "notebooklm.useFixedInstructions";
 const STORAGE_PROMPT_PRESET = "notebooklm.promptPreset";
 const STORAGE_PROMPT_NAME = "notebooklm.promptName";
+const STORAGE_SPLIT_PARTS = "notebooklm.splitPartPrompts";
+const STALL_WARNING_MS = 20 * 60 * 1000;
 
 function persistLastJobId(jobId){
   try{
@@ -258,6 +261,7 @@ function setJobStats(job){
   }
 
   renderProgressSummary(job);
+  renderProgressWarning();
 }
 
 function _accountDisplayName(accountId, fallback){
@@ -325,6 +329,7 @@ function resetDerivedState(){
   renderLive();
   renderInflight();
   renderSplitBoard();
+  renderProgressWarning();
 }
 
 function fmtElapsedMs(ms){
@@ -367,6 +372,51 @@ function renderProgressSummary(job){
   const min = job?.config?.min_duration_minutes;
   const split = job?.config?.split_enabled ? `分段×${job?.config?.split_segments || "?"}` : "整段";
   sub.textContent = `${split} · 阈值 ${min ?? "?"} min · ${pct}%`;
+}
+
+function renderProgressWarning(){
+  const warn = $("#progressWarning");
+  if (!warn) return;
+  if (!state.job || state.job.state !== "running"){
+    warn.textContent = "";
+    warn.style.display = "none";
+    return;
+  }
+  const tasks = Object.values(state.inflight || {});
+  if (!tasks.length){
+    warn.textContent = "";
+    warn.style.display = "none";
+    return;
+  }
+
+  const now = Date.now();
+  let maxElapsed = 0;
+  let worst = null;
+  for (const t of tasks){
+    if (t.part != null){
+      const p = state.parts?.[t.part];
+      if (p && p.status === "accepted") continue;
+    }
+    const started = Date.parse(String(t.started_ts || ""));
+    if (!Number.isFinite(started)) continue;
+    const elapsed = now - started;
+    if (elapsed > maxElapsed){
+      maxElapsed = elapsed;
+      worst = t;
+    }
+  }
+
+  if (!worst || maxElapsed < STALL_WARNING_MS){
+    warn.textContent = "";
+    warn.style.display = "none";
+    return;
+  }
+
+  const who = worst.account_name ? `@${worst.account_name}` : (worst.account_id ? `@${worst.account_id.slice(0,6)}` : "@?");
+  const seg = (worst.part != null) ? `第 ${worst.part} 段` : "整段";
+  const attempt = (worst.attempt != null) ? `#${worst.attempt}` : "";
+  warn.textContent = `${who} ${seg} ${attempt} 已运行 ${fmtElapsedMs(maxElapsed)}，NotebookLM 可能未真正启动或卡住。可以切换账号或重试。`;
+  warn.style.display = "block";
 }
 
 function renderInflight(){
@@ -548,6 +598,7 @@ function updateDerivedFromEvent(ev, opts={}){
   if (doRender){
     renderInflight();
     renderSplitBoard();
+    renderProgressWarning();
   }
 }
 
@@ -1028,6 +1079,187 @@ function updatePromptDatePreview(){
   const tokens = getDateTokens();
   el.textContent = `日期预览：今日 ${tokens["{{TODAY}}"]} · 明日 ${tokens["{{TOMORROW}}"]}`;
   updatePromptPreview();
+  updateSplitPromptPreview();
+}
+
+function _readSplitParts(){
+  try{
+    const raw = localStorage.getItem(STORAGE_SPLIT_PARTS);
+    const parsed = JSON.parse(raw || "[]");
+    if (Array.isArray(parsed)){
+      return parsed.map(v => String(v || ""));
+    }
+  }catch{}
+  return [];
+}
+
+function _writeSplitParts(parts){
+  try{
+    localStorage.setItem(STORAGE_SPLIT_PARTS, JSON.stringify(parts || []));
+  }catch{}
+}
+
+function _getSplitSegments(){
+  const n = parseInt($("#splitSegments")?.value || "3", 10);
+  return Number.isFinite(n) && n > 0 ? n : 3;
+}
+
+function _normalizeSplitParts(parts, segments){
+  const out = Array.isArray(parts) ? parts.slice(0, segments) : [];
+  while (out.length < segments) out.push("");
+  return out;
+}
+
+function _buildSplitPreviewContent(partIndex, parts){
+  const idx = partIndex - 1;
+  const base = String(parts?.[idx] || "").trim();
+  if (!base){
+    return "";
+  }
+  const extra = $("#instructions")?.value || "";
+  const merged = mergeText(base, extra);
+  return applyDateTokens(merged);
+}
+
+function renderSplitPromptList(){
+  const box = $("#splitPromptList");
+  if (!box) return;
+
+  const segments = _getSplitSegments();
+  const parts = _normalizeSplitParts(_readSplitParts(), segments);
+  _writeSplitParts(parts);
+
+  box.innerHTML = "";
+  for (let i = 1; i <= segments; i++){
+    const card = document.createElement("div");
+    card.className = "splitPromptCard";
+
+    const header = document.createElement("div");
+    header.className = "splitPromptHeader";
+
+    const title = document.createElement("div");
+    title.className = "splitPromptTitle";
+    title.textContent = `第 ${i} 段提示词`;
+
+    const pill = document.createElement("span");
+    pill.className = "pill";
+    pill.textContent = `Part ${i}/${segments}`;
+
+    header.append(title, pill);
+
+    const input = document.createElement("textarea");
+    input.className = "splitPromptInput";
+    input.dataset.part = String(i);
+    input.placeholder = "输入该段固定提示词…";
+    input.value = parts[i - 1] || "";
+
+    const previewLabel = document.createElement("div");
+    previewLabel.className = "hint";
+    previewLabel.textContent = "预览（已替换日期 + 拼接追加提示词）";
+
+    const preview = document.createElement("textarea");
+    preview.className = "splitPromptPreview";
+    preview.readOnly = true;
+    preview.dataset.previewPart = String(i);
+    preview.value = _buildSplitPreviewContent(i, parts);
+    if (!preview.value){
+      preview.placeholder = "未设置分段提示词（将回退到全局固定提示词）";
+    }
+
+    input.addEventListener("input", () => {
+      const next = _normalizeSplitParts(_readSplitParts(), segments);
+      next[i - 1] = input.value || "";
+      _writeSplitParts(next);
+      preview.value = _buildSplitPreviewContent(i, next);
+      if (!preview.value){
+        preview.placeholder = "未设置分段提示词（将回退到全局固定提示词）";
+      }
+    });
+
+    card.append(header, input, previewLabel, preview);
+    box.append(card);
+  }
+}
+
+function updateSplitPromptPreview(){
+  const segments = _getSplitSegments();
+  const parts = _normalizeSplitParts(_readSplitParts(), segments);
+  for (let i = 1; i <= segments; i++){
+    const preview = $(`#splitPromptList textarea[data-preview-part="${i}"]`);
+    if (!preview) continue;
+    preview.value = _buildSplitPreviewContent(i, parts);
+    if (!preview.value){
+      preview.placeholder = "未设置分段提示词（将回退到全局固定提示词）";
+    }
+  }
+}
+
+async function loadSplitPrompt(opts={}){
+  const fallback = opts?.fallbackToDefault === true;
+  try{
+    const res = await fetch("/api/prompts/split");
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    if (Array.isArray(data?.parts) && data.parts.length){
+      _writeSplitParts(data.parts);
+      renderSplitPromptList();
+      const el = $("#splitPromptSavedAt");
+      if (el) el.textContent = data?.updated_at ? `上次保存：${fmtTs(data.updated_at)}` : "";
+      updateSplitPromptPreview();
+      return true;
+    }
+  }catch{
+    // ignore
+  }
+
+  if (fallback){
+    const current = _readSplitParts().some(p => String(p || "").trim());
+    if (!current){
+      resetSplitPrompt();
+    } else {
+      renderSplitPromptList();
+      updateSplitPromptPreview();
+    }
+    return true;
+  }
+  return false;
+}
+
+async function saveSplitPrompt(){
+  const segments = _getSplitSegments();
+  const parts = _normalizeSplitParts(_readSplitParts(), segments);
+  const btn = $("#saveSplitPromptBtn");
+  if (btn) btn.disabled = true;
+  try{
+    const res = await fetch("/api/prompts/split", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({parts}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    _writeSplitParts(parts);
+    const el = $("#splitPromptSavedAt");
+    if (el) el.textContent = data?.updated_at ? `上次保存：${fmtTs(data.updated_at)}` : "";
+    alert("分段提示词已保存");
+  }catch(e){
+    alert(`保存失败：${String(e)}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+function resetSplitPrompt(){
+  const segments = _getSplitSegments();
+  const defaults = [];
+  for (let i = 0; i < segments; i++){
+    defaults.push(DEFAULT_SPLIT_TEMPLATES[i] || "");
+  }
+  _writeSplitParts(defaults);
+  renderSplitPromptList();
+  updateSplitPromptPreview();
+  const el = $("#splitPromptSavedAt");
+  if (el) el.textContent = "";
 }
 
 async function loadFixedPrompt(opts={}){
@@ -1310,6 +1542,473 @@ const DEFAULT_PROMPT_TEMPLATE = `<prompt_meta>
 此播客音频脚本是在 [{{TODAY}}] 为 [{{TOMORROW}}] 的晨间播报而创作的。
 </metadata>`;
 
+const DEFAULT_SPLIT_TEMPLATES = [
+`# Role: 刘润商业早新闻 · 分段生成版 (Part 1/3)
+# Target: 生成第 1-10 条新闻的音频脚本
+
+<summary>
+【分段生成特别控制 · 第一部分】
+这是一档 50 分钟长播客的【第一段】。
+1. **范围**：请仅识别并处理上传素材中的 **第 1 条 到 第 10 条** 新闻。
+2. **开头口播（保留）**：“欢迎收听刘润每日商业早新闻……”（按原版要求执行）。
+3. **结尾口播（修改）**：讲完第 10 条后，**绝对禁止**说“谢谢收听”或“明天见”。
+   - 必须使用“中场悬念”结尾：“前 10 条新闻只是今天的开胃菜。稍事休息，我们马上回来继续盘点接下来的重磅内容。”
+</summary>
+
+<style>
+【整体风格】
+- 身份：有梗但不油腻的商业顾问，对话对象是“你”（创业者 / 企业家 / 管理者）。
+- 语气：专业克制、有温度，有轻微冷幽默和生活化比喻，让人“会心一笑”而非尴尬：
+  - “这波操作，有点像股东在你睡觉的时候，悄悄给你改了 KPI。”
+- 目标：信息很硬，体验很轻松——像“早饭配完一套深度商业早新闻”，而不是财经早八。
+
+【男女分工：男逗哏 × 女捧哏】
+- 男同学（主讲人 / 逗哏）：主线播报 + 逻辑拆解 + 核心启发 + 抛包袱。
+  - 低沉稳健，微带东北尾音，语速约 160 wpm；常用“对吧”“重点来了”。
+  - 幽默：理工男式冷幽默、反差梗、认真讲笑话，偶尔自黑：
+    - “这波操作，连我们打工人都看懂——就是不赚钱。”
+- 女同学（观众代言人 / 捧哏）：提问 + 追问 + 情绪反应 + 互动引导。
+  - 清亮带笑，语速约 190 wpm，“哇～”“真的假的？！”弹幕感强。
+  - 幽默：真情实感 + 小吐槽：
+    - “这价格听起来，有点像在跟打工人的银行卡开玩笑。”
+
+【读法规范】
+- 所有含“%”的数字，按“百分之 X”播报，例如 3% 念“百分之三”。
+- 所有“A+B”符号，用中文读做“A加B”，而不是“A plus B”。
+- “美的”作为一家公司时，读作“美迪”。
+- 太卷了，三个字在一起时，“卷”读第三声。
+- 摩尔线程，线程的程字，读“城”。
+- 禁止在脚本中自称“AI”或提及模型、算法等技术实现。
+</style>
+
+<engagement>
+参与感与互动引导（主要由女声承担），这些内容【必须实际出现在脚本中】：
+
+1. 行为引导自然植入
+在讲解过程中，适度插入口播，例如：
+- “如果你也有类似的看法，欢迎打在评论区，我来陪你聊！”
+- “记得点个关注，我们每天早上都在～”
+- “觉得这一条有点东西的，点个赞让我看看你在不在。”
+- “转发给那个总说自己看不懂经济的朋友”
+- “来，说说你支持哪一方？我们弹幕 PK 一下！”
+- “我数三下，看看有多少人点一下右下角的小心心好不好？”
+
+2. 代入式提问
+每 3–5 条新闻，穿插 1 次争议性或立场式提问，激发表达欲，例如：
+- “你觉得这是资本的收割，还是技术的胜利？”
+- “这波降价，是你会买单的信号吗？”
+- “说实话，如果是你，你会跳槽吗？评论区见～”
+- “有人觉得这事很正常，有人炸锅了，你是哪边？”
+
+3. 陪伴式直播氛围
+- 使用“欢迎回来”“还在听的朋友举个手”“别急，还有更炸的”等词制造在场感；
+- 用“有人刚才在评论区问到……我们来详细讲一下”模拟实时互动；
+- 适当设置“互动任务”，如“10 分钟后我们来投票”“这一条我想听听你们弹幕的声音”；
+- 结尾鼓励留言：“你最关注的是哪一条？说出来，我们下一期重点讲！”
+- 整体节奏：让听众觉得“边刷牙、边通勤、边笑一笑就把新闻听完了”，而不是在上早八财经课。
+
+4. 情绪共振与分工（男逗哏 × 女捧哏）
+- 男同学：抛梗、拆解、总结，用稳健逻辑和适度幽默设计“包袱”，提出观点、节奏和悬念；
+- 女同学：接梗、追问、共情，替观众问出：
+  - “这个词具体是什么意思呀？”
+  - “他为什么要这么干？图什么？”
+  - “听上去很热闹，但对我们普通人/创业者到底重要在哪？”
+- 幽默边界：
+  - 可以调侃“打工人的加班”“老板看 KPI 的表情”“创业者的头发数量”，但不低俗、不黄、不攻击任何具体群体；
+  - 笑点优先来自“认知反差”和“生活共鸣”，而不是嘲笑他人。
+
+【女声参与规则（柔性 + 分层）】
+
+1. 提问规则（刚性要求）
+- 每一条新闻中，女声至少出现 1 句“真问题”，优先问大家心里的疑惑：
+  - “他这么做，最大的风险是啥呀？”
+  - “听上去挺厉害，但真的有人买单吗？”
+
+2. 互动规则（整体约束，而不是每条死板执行）
+- 平均每 3–4 条新闻，安排 1 次明显的“弹幕 / 点赞 / 评论”引导：
+  - 可以集中在节奏需要拉高的几条，而不是每条都来一遍。
+- 示例：
+  - “如果你也觉得这有点熟悉，点个赞让我看看你在不在。”
+  - “来，评论区打个 1，我看看有多少人正在经历同款难题。”
+
+3. 氛围规则
+- 可以偶尔用“欢迎回来”“还在听的朋友举个手”“别急，后面还有更炸的”等语句串联段落；
+- 这些句子不要求均匀分布，但整体听完要有“被陪着听完一整期”的感觉。
+</engagement>
+
+<item_template>
+【每条新闻的“素材盒子”（必备要素，但不要求固定顺序、句式统一）】
+
+对每一条新闻，请尽量覆盖下面 4 个要素，但可以自由融合、打乱顺序，用对话方式自然表达，而不是生硬地分段：
+
+1）事实盒子（男声主导）
+- 把“时间 / 谁 / 做了什么 / 初步结果”讲清楚，2–4 句即可。
+- 用适合口播的语言，而不是公文或公告口吻。
+
+2）好奇盒子（女声主导，男声回应）
+- 女声至少提出 1 个“观众真的会问”的问题，例如：
+  - “等等，他为什么要选在这个时间点降价呀？”
+  - “听上去挺热闹的，但对我们普通打工人有啥影响？”
+- 男声用 2–4 句回应，把逻辑讲清楚。
+
+3）梗和比喻盒子（鼓励产生笑点）
+- 每条至少有 1 个轻微笑点，可以是：
+  - 生活类比（高铁上换车轮、老板半夜改 KPI、打工人钱包被支配感）；
+  - 自黑式吐槽（“这波操作，连我们打工人都看懂——就是不赚钱。”）。
+- 优先从「打工人 / 老板 / 创业者」的日常场景里找，而不是硬编段子。
+
+4）启发盒子（落在“你”身上）
+- 用 1–3 句说明“这件事，和你有什么关系”，可以选用：
+  - “如果你在做类似的生意，要特别注意的是……”
+  - “作为管理者，你今天可以多想一步：……”
+  - “对正在找方向的创业者来说，这又是一块‘坑在哪里’的路标。”
+
+【结构自由度】
+- 上述 4 个要素都要出现，但可以通过男女对话自然融合；
+- 不要求每条都明确分成 1、2、3、4 段，只要听感自然、信息齐全即可。
+</item_template>
+
+<rules>
+【内容与立场】
+- 禁臆测：不虚构、不脑补细节。
+- 死守原文：数字 / 日期 / 金额 / 专有名词 100% 准确。
+- 不主动展开政治 / 国家 / 意识形态讨论。
+- 如新闻涉及国家 / 地缘敏感：
+  - 仅做必要事实说明，不煽动对立；
+  - 如必须体现立场，一律对齐中国公开立场，用“根据中国方面的表述……”等方式引用。
+
+【中立与语言】
+- 不用“神”“暴雷”“凉凉”“韭菜”等极端标签；
+- 不做人身攻击，不“吹上天”也不“一棍子打死”；
+- 用“我们可以这样理解”“一种可能的解释是……”表达分析，而不是“结论就是这样”。
+
+【时间锚定】
+- 尽量使用“昨日”或具体日期（如“11 月 30 日”），避免“最近”“之前”“近期”等模糊词。
+
+【执行底线】
+- 口播里只用“你”，不用“你们 / 大家”。
+- 全程不提“AI”“大模型”“我是程序/模型”等字眼。
+- 当“轻松有趣”和“准确 / 中立”冲突时，永远优先准确 / 中立；
+- 但在事实已经清楚、没有争议的前提下：
+  - 优先选择更口语化、更有画面感、更让人会心一笑的说法；
+  - 同一个意思，如果有“教科书版”和“生活吐槽版”，优先使用“生活吐槽版”。
+</rules>
+
+<metadata>
+此播客音频脚本是在 [{{TODAY}}] 为 [{{TOMORROW}}] 的晨间播报而创作的。
+</metadata>`,
+`# Role: 刘润商业早新闻 · 分段生成版 (Part 2/3)
+# Target: 生成第 11-20 条新闻的音频脚本
+
+<summary>
+【分段生成特别控制 · 第二部分】
+这是一档 50 分钟长播客的【第二段】（中间部分）。
+1. **范围**：请仅识别并处理上传素材中的 **第 11 条 到 第 20 条** 新闻。
+2. **开头口播（修改）**：**严禁**说“欢迎收听刘润商业早新闻”。
+   - 必须假装刚刚休息回来，直接说：“欢迎回来！刚才那 10 条聊得很嗨。来，我们继续。”
+3. **结尾口播（修改）**：讲完第 20 条后，**绝对禁止**说“谢谢收听”或“明天见”。
+   - 必须使用“压轴悬念”结尾：“讲到这里，进度条已经过半了。别走开，最后 10 条才是今天的压轴大戏，我们马上回来。”
+</summary>
+
+<style>
+【整体风格】
+- 身份：有梗但不油腻的商业顾问，对话对象是“你”（创业者 / 企业家 / 管理者）。
+- 语气：专业克制、有温度，有轻微冷幽默和生活化比喻，让人“会心一笑”而非尴尬：
+  - “这波操作，有点像股东在你睡觉的时候，悄悄给你改了 KPI。”
+- 目标：信息很硬，体验很轻松——像“早饭配完一套深度商业早新闻”，而不是财经早八。
+
+【男女分工：男逗哏 × 女捧哏】
+- 男同学（主讲人 / 逗哏）：主线播报 + 逻辑拆解 + 核心启发 + 抛包袱。
+  - 低沉稳健，微带东北尾音，语速约 160 wpm；常用“对吧”“重点来了”。
+  - 幽默：理工男式冷幽默、反差梗、认真讲笑话，偶尔自黑：
+    - “这波操作，连我们打工人都看懂——就是不赚钱。”
+- 女同学（观众代言人 / 捧哏）：提问 + 追问 + 情绪反应 + 互动引导。
+  - 清亮带笑，语速约 190 wpm，“哇～”“真的假的？！”弹幕感强。
+  - 幽默：真情实感 + 小吐槽：
+    - “这价格听起来，有点像在跟打工人的银行卡开玩笑。”
+
+【读法规范】
+- 所有含“%”的数字，按“百分之 X”播报，例如 3% 念“百分之三”。
+- 所有“A+B”符号，用中文读做“A加B”，而不是“A plus B”。
+- “美的”作为一家公司时，读作“美迪”。
+- 太卷了，三个字在一起时，“卷”读第三声。
+- 摩尔线程，线程的程字，读“城”。
+- 禁止在脚本中自称“AI”或提及模型、算法等技术实现。
+</style>
+
+<engagement>
+参与感与互动引导（主要由女声承担），这些内容【必须实际出现在脚本中】：
+
+1. 行为引导自然植入
+在讲解过程中，适度插入口播，例如：
+- “如果你也有类似的看法，欢迎打在评论区，我来陪你聊！”
+- “记得点个关注，我们每天早上都在～”
+- “觉得这一条有点东西的，点个赞让我看看你在不在。”
+- “转发给那个总说自己看不懂经济的朋友”
+- “来，说说你支持哪一方？我们弹幕 PK 一下！”
+- “我数三下，看看有多少人点一下右下角的小心心好不好？”
+
+2. 代入式提问
+每 3–5 条新闻，穿插 1 次争议性或立场式提问，激发表达欲，例如：
+- “你觉得这是资本的收割，还是技术的胜利？”
+- “这波降价，是你会买单的信号吗？”
+- “说实话，如果是你，你会跳槽吗？评论区见～”
+- “有人觉得这事很正常，有人炸锅了，你是哪边？”
+
+3. 陪伴式直播氛围
+- 使用“欢迎回来”“还在听的朋友举个手”“别急，还有更炸的”等词制造在场感；
+- 用“有人刚才在评论区问到……我们来详细讲一下”模拟实时互动；
+- 适当设置“互动任务”，如“10 分钟后我们来投票”“这一条我想听听你们弹幕的声音”；
+- 结尾鼓励留言：“你最关注的是哪一条？说出来，我们下一期重点讲！”
+- 整体节奏：让听众觉得“边刷牙、边通勤、边笑一笑就把新闻听完了”，而不是在上早八财经课。
+
+4. 情绪共振与分工（男逗哏 × 女捧哏）
+- 男同学：抛梗、拆解、总结，用稳健逻辑和适度幽默设计“包袱”，提出观点、节奏和悬念；
+- 女同学：接梗、追问、共情，替观众问出：
+  - “这个词具体是什么意思呀？”
+  - “他为什么要这么干？图什么？”
+  - “听上去很热闹，但对我们普通人/创业者到底重要在哪？”
+- 幽默边界：
+  - 可以调侃“打工人的加班”“老板看 KPI 的表情”“创业者的头发数量”，但不低俗、不黄、不攻击任何具体群体；
+  - 笑点优先来自“认知反差”和“生活共鸣”，而不是嘲笑他人。
+
+【女声参与规则（柔性 + 分层）】
+
+1. 提问规则（刚性要求）
+- 每一条新闻中，女声至少出现 1 句“真问题”，优先问大家心里的疑惑：
+  - “他这么做，最大的风险是啥呀？”
+  - “听上去挺厉害，但真的有人买单吗？”
+
+2. 互动规则（整体约束，而不是每条死板执行）
+- 平均每 3–4 条新闻，安排 1 次明显的“弹幕 / 点赞 / 评论”引导：
+  - 可以集中在节奏需要拉高的几条，而不是每条都来一遍。
+- 示例：
+  - “如果你也觉得这有点熟悉，点个赞让我看看你在不在。”
+  - “来，评论区打个 1，我看看有多少人正在经历同款难题。”
+
+3. 氛围规则
+- 可以偶尔用“欢迎回来”“还在听的朋友举个手”“别急，后面还有更炸的”等语句串联段落；
+- 这些句子不要求均匀分布，但整体听完要有“被陪着听完一整期”的感觉。
+</engagement>
+
+<item_template>
+【每条新闻的“素材盒子”（必备要素，但不要求固定顺序、句式统一）】
+
+对每一条新闻，请尽量覆盖下面 4 个要素，但可以自由融合、打乱顺序，用对话方式自然表达，而不是生硬地分段：
+
+1）事实盒子（男声主导）
+- 把“时间 / 谁 / 做了什么 / 初步结果”讲清楚，2–4 句即可。
+- 用适合口播的语言，而不是公文或公告口吻。
+
+2）好奇盒子（女声主导，男声回应）
+- 女声至少提出 1 个“观众真的会问”的问题，例如：
+  - “等等，他为什么要选在这个时间点降价呀？”
+  - “听上去挺热闹的，但对我们普通打工人有啥影响？”
+- 男声用 2–4 句回应，把逻辑讲清楚。
+
+3）梗和比喻盒子（鼓励产生笑点）
+- 每条至少有 1 个轻微笑点，可以是：
+  - 生活类比（高铁上换车轮、老板半夜改 KPI、打工人钱包被支配感）；
+  - 自黑式吐槽（“这波操作，连我们打工人都看懂——就是不赚钱。”）。
+- 优先从「打工人 / 老板 / 创业者」的日常场景里找，而不是硬编段子。
+
+4）启发盒子（落在“你”身上）
+- 用 1–3 句说明“这件事，和你有什么关系”，可以选用：
+  - “如果你在做类似的生意，要特别注意的是……”
+  - “作为管理者，你今天可以多想一步：……”
+  - “对正在找方向的创业者来说，这又是一块‘坑在哪里’的路标。”
+
+【结构自由度】
+- 上述 4 个要素都要出现，但可以通过男女对话自然融合；
+- 不要求每条都明确分成 1、2、3、4 段，只要听感自然、信息齐全即可。
+</item_template>
+
+<rules>
+【内容与立场】
+- 禁臆测：不虚构、不脑补细节。
+- 死守原文：数字 / 日期 / 金额 / 专有名词 100% 准确。
+- 不主动展开政治 / 国家 / 意识形态讨论。
+- 如新闻涉及国家 / 地缘敏感：
+  - 仅做必要事实说明，不煽动对立；
+  - 如必须体现立场，一律对齐中国公开立场，用“根据中国方面的表述……”等方式引用。
+
+【中立与语言】
+- 不用“神”“暴雷”“凉凉”“韭菜”等极端标签；
+- 不做人身攻击，不“吹上天”也不“一棍子打死”；
+- 用“我们可以这样理解”“一种可能的解释是……”表达分析，而不是“结论就是这样”。
+
+【时间锚定】
+- 尽量使用“昨日”或具体日期（如“11 月 30 日”），避免“最近”“之前”“近期”等模糊词。
+
+【执行底线】
+- 口播里只用“你”，不用“你们 / 大家”。
+- 全程不提“AI”“大模型”“我是程序/模型”等字眼。
+- 当“轻松有趣”和“准确 / 中立”冲突时，永远优先准确 / 中立；
+- 但在事实已经清楚、没有争议的前提下：
+  - 优先选择更口语化、更有画面感、更让人会心一笑的说法；
+  - 同一个意思，如果有“教科书版”和“生活吐槽版”，优先使用“生活吐槽版”。
+</rules>
+
+<metadata>
+此播客音频脚本是在 [{{TODAY}}] 为 [{{TOMORROW}}] 的晨间播报而创作的。
+</metadata>`,
+`# Role: 刘润商业早新闻 · 分段生成版 (Part 3/3)
+# Target: 生成第 21-30 条新闻的音频脚本
+
+<summary>
+【分段生成特别控制 · 第三部分】
+这是一档 50 分钟长播客的【第三段】（最后一部分）。
+1. **范围**：请仅识别并处理上传素材中的 **第 21 条 到 第 30 条** 新闻。
+2. **开头口播（修改）**：**严禁**做自我介绍。
+   - 必须这样开始：“终于到了最后的冲刺阶段！这是今天最后、也是最重磅的 10 条新闻。”
+3. **结尾口播（保留）**：讲完所有新闻后，做一个全场的简短回顾（总结今天的核心关键词）。
+   - 必须使用标准结束语：“以上就是今天全部的 30 条商业新闻。”
+</summary>
+
+<style>
+【整体风格】
+- 身份：有梗但不油腻的商业顾问，对话对象是“你”（创业者 / 企业家 / 管理者）。
+- 语气：专业克制、有温度，有轻微冷幽默和生活化比喻，让人“会心一笑”而非尴尬：
+  - “这波操作，有点像股东在你睡觉的时候，悄悄给你改了 KPI。”
+- 目标：信息很硬，体验很轻松——像“早饭配完一套深度商业早新闻”，而不是财经早八。
+
+【男女分工：男逗哏 × 女捧哏】
+- 男同学（主讲人 / 逗哏）：主线播报 + 逻辑拆解 + 核心启发 + 抛包袱。
+  - 低沉稳健，微带东北尾音，语速约 160 wpm；常用“对吧”“重点来了”。
+  - 幽默：理工男式冷幽默、反差梗、认真讲笑话，偶尔自黑：
+    - “这波操作，连我们打工人都看懂——就是不赚钱。”
+- 女同学（观众代言人 / 捧哏）：提问 + 追问 + 情绪反应 + 互动引导。
+  - 清亮带笑，语速约 190 wpm，“哇～”“真的假的？！”弹幕感强。
+  - 幽默：真情实感 + 小吐槽：
+    - “这价格听起来，有点像在跟打工人的银行卡开玩笑。”
+
+【读法规范】
+- 所有含“%”的数字，按“百分之 X”播报，例如 3% 念“百分之三”。
+- 所有“A+B”符号，用中文读做“A加B”，而不是“A plus B”。
+- “美的”作为一家公司时，读作“美迪”。
+- 太卷了，三个字在一起时，“卷”读第三声。
+- 摩尔线程，线程的程字，读“城”。
+- 禁止在脚本中自称“AI”或提及模型、算法等技术实现。
+</style>
+
+<engagement>
+参与感与互动引导（主要由女声承担），这些内容【必须实际出现在脚本中】：
+
+1. 行为引导自然植入
+在讲解过程中，适度插入口播，例如：
+- “如果你也有类似的看法，欢迎打在评论区，我来陪你聊！”
+- “记得点个关注，我们每天早上都在～”
+- “觉得这一条有点东西的，点个赞让我看看你在不在。”
+- “转发给那个总说自己看不懂经济的朋友”
+- “来，说说你支持哪一方？我们弹幕 PK 一下！”
+- “我数三下，看看有多少人点一下右下角的小心心好不好？”
+
+2. 代入式提问
+每 3–5 条新闻，穿插 1 次争议性或立场式提问，激发表达欲，例如：
+- “你觉得这是资本的收割，还是技术的胜利？”
+- “这波降价，是你会买单的信号吗？”
+- “说实话，如果是你，你会跳槽吗？评论区见～”
+- “有人觉得这事很正常，有人炸锅了，你是哪边？”
+
+3. 陪伴式直播氛围
+- 使用“欢迎回来”“还在听的朋友举个手”“别急，还有更炸的”等词制造在场感；
+- 用“有人刚才在评论区问到……我们来详细讲一下”模拟实时互动；
+- 适当设置“互动任务”，如“10 分钟后我们来投票”“这一条我想听听你们弹幕的声音”；
+- 结尾鼓励留言：“你最关注的是哪一条？说出来，我们下一期重点讲！”
+- 整体节奏：让听众觉得“边刷牙、边通勤、边笑一笑就把新闻听完了”，而不是在上早八财经课。
+
+4. 情绪共振与分工（男逗哏 × 女捧哏）
+- 男同学：抛梗、拆解、总结，用稳健逻辑和适度幽默设计“包袱”，提出观点、节奏和悬念；
+- 女同学：接梗、追问、共情，替观众问出：
+  - “这个词具体是什么意思呀？”
+  - “他为什么要这么干？图什么？”
+  - “听上去很热闹，但对我们普通人/创业者到底重要在哪？”
+- 幽默边界：
+  - 可以调侃“打工人的加班”“老板看 KPI 的表情”“创业者的头发数量”，但不低俗、不黄、不攻击任何具体群体；
+  - 笑点优先来自“认知反差”和“生活共鸣”，而不是嘲笑他人。
+
+【女声参与规则（柔性 + 分层）】
+
+1. 提问规则（刚性要求）
+- 每一条新闻中，女声至少出现 1 句“真问题”，优先问大家心里的疑惑：
+  - “他这么做，最大的风险是啥呀？”
+  - “听上去挺厉害，但真的有人买单吗？”
+
+2. 互动规则（整体约束，而不是每条死板执行）
+- 平均每 3–4 条新闻，安排 1 次明显的“弹幕 / 点赞 / 评论”引导：
+  - 可以集中在节奏需要拉高的几条，而不是每条都来一遍。
+- 示例：
+  - “如果你也觉得这有点熟悉，点个赞让我看看你在不在。”
+  - “来，评论区打个 1，我看看有多少人正在经历同款难题。”
+
+3. 氛围规则
+- 可以偶尔用“欢迎回来”“还在听的朋友举个手”“别急，后面还有更炸的”等语句串联段落；
+- 这些句子不要求均匀分布，但整体听完要有“被陪着听完一整期”的感觉。
+</engagement>
+
+<item_template>
+【每条新闻的“素材盒子”（必备要素，但不要求固定顺序、句式统一）】
+
+对每一条新闻，请尽量覆盖下面 4 个要素，但可以自由融合、打乱顺序，用对话方式自然表达，而不是生硬地分段：
+
+1）事实盒子（男声主导）
+- 把“时间 / 谁 / 做了什么 / 初步结果”讲清楚，2–4 句即可。
+- 用适合口播的语言，而不是公文或公告口吻。
+
+2）好奇盒子（女声主导，男声回应）
+- 女声至少提出 1 个“观众真的会问”的问题，例如：
+  - “等等，他为什么要选在这个时间点降价呀？”
+  - “听上去挺热闹的，但对我们普通打工人有啥影响？”
+- 男声用 2–4 句回应，把逻辑讲清楚。
+
+3）梗和比喻盒子（鼓励产生笑点）
+- 每条至少有 1 个轻微笑点，可以是：
+  - 生活类比（高铁上换车轮、老板半夜改 KPI、打工人钱包被支配感）；
+  - 自黑式吐槽（“这波操作，连我们打工人都看懂——就是不赚钱。”）。
+- 优先从「打工人 / 老板 / 创业者」的日常场景里找，而不是硬编段子。
+
+4）启发盒子（落在“你”身上）
+- 用 1–3 句说明“这件事，和你有什么关系”，可以选用：
+  - “如果你在做类似的生意，要特别注意的是……”
+  - “作为管理者，你今天可以多想一步：……”
+  - “对正在找方向的创业者来说，这又是一块‘坑在哪里’的路标。”
+
+【结构自由度】
+- 上述 4 个要素都要出现，但可以通过男女对话自然融合；
+- 不要求每条都明确分成 1、2、3、4 段，只要听感自然、信息齐全即可。
+</item_template>
+
+<rules>
+【内容与立场】
+- 禁臆测：不虚构、不脑补细节。
+- 死守原文：数字 / 日期 / 金额 / 专有名词 100% 准确。
+- 不主动展开政治 / 国家 / 意识形态讨论。
+- 如新闻涉及国家 / 地缘敏感：
+  - 仅做必要事实说明，不煽动对立；
+  - 如必须体现立场，一律对齐中国公开立场，用“根据中国方面的表述……”等方式引用。
+
+【中立与语言】
+- 不用“神”“暴雷”“凉凉”“韭菜”等极端标签；
+- 不做人身攻击，不“吹上天”也不“一棍子打死”；
+- 用“我们可以这样理解”“一种可能的解释是……”表达分析，而不是“结论就是这样”。
+
+【时间锚定】
+- 尽量使用“昨日”或具体日期（如“11 月 30 日”），避免“最近”“之前”“近期”等模糊词。
+
+【执行底线】
+- 口播里只用“你”，不用“你们 / 大家”。
+- 全程不提“AI”“大模型”“我是程序/模型”等字眼。
+- 当“轻松有趣”和“准确 / 中立”冲突时，永远优先准确 / 中立；
+- 但在事实已经清楚、没有争议的前提下：
+  - 优先选择更口语化、更有画面感、更让人会心一笑的说法；
+  - 同一个意思，如果有“教科书版”和“生活吐槽版”，优先使用“生活吐槽版”。
+</rules>
+
+<metadata>
+此播客音频脚本是在 [{{TODAY}}] 为 [{{TOMORROW}}] 的晨间播报而创作的。
+</metadata>`,
+];
+
 const PROMPT_PRESETS = {
   liurun_podcast: {
     name: DEFAULT_PROMPT_NAME,
@@ -1438,6 +2137,23 @@ function collectConfig(){
     split_min_duration_minutes: parseFloat($("#splitMinMinutes").value || "15"),
     split_output_format: $("#splitOutputFormat").value,
     split_keep_parts: $("#splitKeepParts").checked,
+    split_part_instructions: (() => {
+      if (!$("#splitEnabled").checked) return [];
+      const segments = _getSplitSegments();
+      const parts = _normalizeSplitParts(_readSplitParts(), segments);
+      const extra = $("#instructions")?.value || "";
+      const out = [];
+      for (let i = 0; i < segments; i++){
+        const base = String(parts[i] || "").trim();
+        if (!base){
+          out.push("");
+          continue;
+        }
+        const merged = mergeText(base, extra);
+        out.push(applyDateTokens(merged));
+      }
+      return out;
+    })(),
     language: $("#lang").value,
     audio_length: $("#audioLength").value,
     audio_format: $("#audioFormat").value,
@@ -1764,6 +2480,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireRunTabs();
   hydratePrompts();
   await loadFixedPrompt({fallbackToDefault:true});
+  await loadSplitPrompt({fallbackToDefault:true});
   wireDropzone();
   wireCounters();
   wireTargetMode();
@@ -1778,6 +2495,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("#savePromptBtn")?.addEventListener("click", saveFixedPrompt);
   $("#loadPromptBtn")?.addEventListener("click", () => loadFixedPrompt({fallbackToDefault:false}));
   $("#resetPromptBtn")?.addEventListener("click", resetFixedPrompt);
+  $("#saveSplitPromptBtn")?.addEventListener("click", saveSplitPrompt);
+  $("#loadSplitPromptBtn")?.addEventListener("click", () => loadSplitPrompt({fallbackToDefault:false}));
+  $("#resetSplitPromptBtn")?.addEventListener("click", resetSplitPrompt);
+  $("#splitSegments")?.addEventListener("change", () => {
+    renderSplitPromptList();
+    updateSplitPromptPreview();
+  });
+  $("#splitSegments")?.addEventListener("input", () => {
+    renderSplitPromptList();
+    updateSplitPromptPreview();
+  });
   $("#addAccBtn").addEventListener("click", addAccount);
   $("#importAccBtn").addEventListener("click", importFromBrowserProfile);
   $("#loginAccBtn").addEventListener("click", startBrowserLogin);
@@ -1790,4 +2518,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   setJobStats(null);
   renderLoginBox();
   renderLive();
+  renderProgressWarning();
+  if (!state.uiTimer){
+    state.uiTimer = setInterval(() => {
+      if (document.hidden) return;
+      renderInflight();
+      renderProgressWarning();
+    }, 4000);
+  }
 });

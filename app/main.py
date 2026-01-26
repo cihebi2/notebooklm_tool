@@ -165,6 +165,30 @@ async def save_fixed_prompt(req: SavePromptRequest) -> dict[str, Any]:
     return fixed
 
 
+class SaveSplitPromptRequest(BaseModel):
+    parts: list[str] = Field(min_length=1, max_length=10)
+
+
+@app.get("/api/prompts/split")
+async def get_split_prompts() -> dict[str, Any]:
+    data = _read_prompts()
+    split = data.get("split") if isinstance(data.get("split"), dict) else {}
+    parts = split.get("parts")
+    if not isinstance(parts, list):
+        parts = []
+    return {"parts": parts, "updated_at": split.get("updated_at")}
+
+
+@app.post("/api/prompts/split")
+async def save_split_prompts(req: SaveSplitPromptRequest) -> dict[str, Any]:
+    parts = [str(p or "") for p in (req.parts or [])][:10]
+    split = {"parts": parts, "updated_at": _now_iso()}
+    data = _read_prompts()
+    data["split"] = split
+    _write_prompts(data)
+    return split
+
+
 @app.post("/api/accounts/import/profile")
 async def import_account_from_profile(req: ImportFromProfileRequest) -> dict[str, Any]:
     from .utils.browser_cookies import export_storage_state_from_profile_id

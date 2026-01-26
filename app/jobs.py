@@ -31,8 +31,9 @@ class JobConfig(BaseModel):
     split_parallel: bool = False
     split_segments: int = Field(ge=2, le=10, default=3)
     split_min_duration_minutes: float = Field(ge=1, le=120, default=15.0)
-    split_output_format: str = Field(default="mp3")  # mp3 | mp4
+    split_output_format: str = Field(default="m4a")  # mp3 | mp4 | m4a
     split_keep_parts: bool = False
+    split_part_instructions: list[str] = Field(default_factory=list)
 
     language: str = Field(default="zh")
     audio_length: str = Field(default="long")  # short|default|long
@@ -55,6 +56,18 @@ class JobConfig(BaseModel):
         if v in {"downloaded", "download", "generated", "outputs"}:
             return "downloaded"
         raise ValueError("target_mode must be one of: accepted, downloaded")
+
+    @field_validator("split_part_instructions")
+    @classmethod
+    def _validate_split_part_instructions(cls, value: list[str] | None) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("split_part_instructions must be a list")
+        cleaned: list[str] = []
+        for item in value[:10]:
+            cleaned.append(str(item or ""))
+        return cleaned
 
 
 def _now_iso() -> str:

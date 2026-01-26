@@ -112,6 +112,30 @@ def _build_part_instructions(
     return _merge_instructions(base, extra)
 
 
+def _select_part_instructions(
+    cfg: "JobConfig",
+    base: str | None,
+    part_index: int,
+    part_total: int,
+    item_start: int | None,
+    item_end: int | None,
+    target_minutes: float,
+) -> str:
+    custom_list = cfg.split_part_instructions or []
+    if len(custom_list) >= part_index:
+        candidate = str(custom_list[part_index - 1] or "").strip()
+        if candidate:
+            return candidate
+    return _build_part_instructions(
+        base=base,
+        part_index=part_index,
+        part_total=part_total,
+        item_start=item_start,
+        item_end=item_end,
+        target_minutes=target_minutes,
+    )
+
+
 async def _wait_for_completion_resilient(
     client: NotebookLMClient,
     notebook_id: str,
@@ -158,6 +182,12 @@ async def _wait_for_completion_resilient(
         current_interval = min(current_interval * 2, max_interval)
 
 
+def _is_poll_studio_timeout(err: BaseException | None) -> bool:
+    if err is None:
+        return False
+    return "POLL_STUDIO" in str(err).upper()
+
+
 async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> None:
     cfg = job.config
 
@@ -170,7 +200,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
     split_parallel = bool(getattr(cfg, "split_parallel", False))
     split_segments = int(getattr(cfg, "split_segments", 3))
     split_min_seconds = float(getattr(cfg, "split_min_duration_minutes", 15.0)) * 60.0
-    split_output_format = str(getattr(cfg, "split_output_format", "mp3") or "mp3").strip().lower()
+    split_output_format = str(getattr(cfg, "split_output_format", "m4a") or "m4a").strip().lower()
     split_keep_parts = bool(getattr(cfg, "split_keep_parts", False))
     split_task_timeout = max(1200.0, min(3600.0, split_min_seconds * 2.0))
 
@@ -227,7 +257,9 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             raise RuntimeError("no valid accounts available")
 
         async def stitch_episode(*, episode_index: int, parts_paths: list[Path]) -> tuple[Path, float]:
-            output_format = split_output_format if split_output_format in {"mp3", "mp4"} else "mp3"
+            output_format = (
+                split_output_format if split_output_format in {"mp3", "mp4", "m4a"} else "m4a"
+            )
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             merged_tmp = job.outputs_dir / f"merged_ep{episode_index:02d}_{job.id}_{ts}.{output_format}"
 
@@ -446,10 +478,13 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     generate_lock = asyncio.Lock()
                                     task_id_by_attempt: dict[int, str] = {}
                                     attempt_by_task: dict[asyncio.Task, int] = {}
+                                    switch_account = False
+                                    no_task_id_count = 0
 
                                     async def run_part_attempt(attempt: int) -> dict[str, Any] | None:
                                         tmp_path: Path | None = None
                                         task_id: str | None = None
+                                        nonlocal no_task_id_count
 
                                         if job.is_cancelled or done_event.is_set() or failed_event.is_set():
                                             return None
@@ -469,7 +504,8 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                         )
 
                                         try:
-                                            part_instructions = _build_part_instructions(
+                                            part_instructions = _select_part_instructions(
+                                                cfg=cfg,
                                                 base=instructions,
                                                 part_index=part.index,
                                                 part_total=part.total,
@@ -486,7 +522,25 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                     audio_format=audio_format,
                                                     audio_length=audio_length,
                                                 )
-                                            task_id = status.task_id
+                                            task_id = getattr(status, "task_id", None) or ""
+                                            if not task_id:
+                                                await publish(
+                                                    {
+                                                        "type": "part_generation_failed",
+                                                        "ts": _now_iso(),
+                                                        "account_id": account.id,
+                                                        "account_name": account.name,
+                                                        "notebook_id": nb.id,
+                                                        "part": part.index,
+                                                        "attempt": attempt,
+                                                        "episode": episode_index,
+                                                        "task_id": "",
+                                                        "error": "generate_audio returned empty task id",
+                                                        "error_code": "NO_TASK_ID",
+                                                    }
+                                                )
+                                                return {"ok": False, "no_task_id": True, "attempt": attempt}
+                                            no_task_id_count = 0
                                             task_id_by_attempt[attempt] = task_id
 
                                             await publish(
@@ -620,6 +674,10 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                     pass
                                             raise
                                         except TimeoutError as e:
+                                            poll_timeout = _is_poll_studio_timeout(e)
+                                            err_msg = str(e)
+                                            if poll_timeout:
+                                                err_msg = f"{err_msg} (switch account)"
                                             await publish(
                                                 {
                                                     "type": "part_attempt_error",
@@ -631,7 +689,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                     "attempt": attempt,
                                                     "episode": episode_index,
                                                     "task_id": task_id,
-                                                    "error": str(e),
+                                                    "error": err_msg,
                                                     "error_type": "TimeoutError",
                                                 }
                                             )
@@ -641,6 +699,14 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                 except Exception:
                                                     pass
                                             await asyncio.sleep(2.0)
+                                            if poll_timeout:
+                                                return {
+                                                    "ok": False,
+                                                    "fatal_for_account": True,
+                                                    "reason": "POLL_STUDIO_TIMEOUT",
+                                                    "attempt": attempt,
+                                                    "task_id": task_id,
+                                                }
                                             return None
                                         except RPCError as e:
                                             await publish(
@@ -682,8 +748,12 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     try:
                                         while accepted_path is None and not (
                                             job.is_cancelled or done_event.is_set() or failed_event.is_set()
-                                        ):
-                                            while next_attempt <= max_attempts and len(active) < per_account_concurrency:
+                                        ) and not switch_account:
+                                            while (
+                                                next_attempt <= max_attempts
+                                                and len(active) < per_account_concurrency
+                                                and not switch_account
+                                            ):
                                                 attempt_no = next_attempt
                                                 next_attempt += 1
                                                 t = asyncio.create_task(run_part_attempt(attempt_no))
@@ -705,7 +775,31 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                 except Exception:
                                                     continue
 
-                                                if not outcome or not outcome.get("ok"):
+                                                if not outcome:
+                                                    continue
+                                                if outcome.get("no_task_id"):
+                                                    no_task_id_count += 1
+                                                    if no_task_id_count >= 3:
+                                                        switch_account = True
+                                                        await publish(
+                                                            {
+                                                                "type": "part_attempt_error",
+                                                                "ts": _now_iso(),
+                                                                "account_id": account.id,
+                                                                "account_name": account.name,
+                                                                "notebook_id": nb.id,
+                                                                "part": part.index,
+                                                                "attempt": int(outcome.get("attempt") or 0),
+                                                                "episode": episode_index,
+                                                                "error": "NO_TASK_ID reached 3 times; switching account",
+                                                                "error_type": "NoTaskIdSwitch",
+                                                            }
+                                                        )
+                                                    continue
+                                                if outcome.get("fatal_for_account"):
+                                                    switch_account = True
+                                                    break
+                                                if not outcome.get("ok"):
                                                     continue
 
                                                 accepted_path = outcome.get("path")
@@ -750,6 +844,8 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                         for tid in set(extra_task_ids)
                                                     ]
                                                     await asyncio.gather(*deletes, return_exceptions=True)
+                                                break
+                                            if switch_account:
                                                 break
                                     finally:
                                         extra_task_ids = []
@@ -1073,7 +1169,8 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 )
 
                                 try:
-                                    part_instructions = _build_part_instructions(
+                                    part_instructions = _select_part_instructions(
+                                        cfg=cfg,
                                         base=instructions,
                                         part_index=part.index,
                                         part_total=part.total,
@@ -1090,7 +1187,22 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                             audio_format=audio_format,
                                             audio_length=audio_length,
                                         )
-                                    task_id = status.task_id
+                                    task_id = getattr(status, "task_id", None) or ""
+                                    if not task_id:
+                                        await publish(
+                                            {
+                                                "type": "part_generation_failed",
+                                                "ts": _now_iso(),
+                                                "account_id": account.id,
+                                                "notebook_id": nb.id,
+                                                "part": part.index,
+                                                "attempt": attempt,
+                                                "task_id": "",
+                                                "error": "generate_audio returned empty task id",
+                                                "error_code": "NO_TASK_ID",
+                                            }
+                                        )
+                                        return None
                                     task_id_by_attempt[attempt] = task_id
 
                                     await publish(
@@ -1371,7 +1483,11 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
 
                             parts_paths.append(accepted_path)
 
-                        output_format = split_output_format if split_output_format in {"mp3", "mp4"} else "mp3"
+                        output_format = (
+                            split_output_format
+                            if split_output_format in {"mp3", "mp4", "m4a"}
+                            else "m4a"
+                        )
 
                         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                         merged_tmp = job.outputs_dir / (
@@ -1513,7 +1629,21 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     audio_format=audio_format,
                                     audio_length=audio_length,
                                 )
-                            task_id = status.task_id
+                            task_id = getattr(status, "task_id", None) or ""
+                            if not task_id:
+                                await publish(
+                                    {
+                                        "type": "generation_failed",
+                                        "ts": _now_iso(),
+                                        "account_id": account.id,
+                                        "notebook_id": nb.id,
+                                        "attempt": attempt,
+                                        "task_id": "",
+                                        "error": "generate_audio returned empty task id",
+                                        "error_code": "NO_TASK_ID",
+                                    }
+                                )
+                                return None
                             task_id_by_attempt[attempt] = task_id
 
                             await publish(

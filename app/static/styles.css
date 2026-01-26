@@ -556,6 +556,16 @@ a.btn{text-decoration:none}
   box-shadow: 0 0 22px rgba(255,179,0,.12);
   transition: width .25s ease;
 }
+.progressWarning{
+  margin-top:10px;
+  border-radius:14px;
+  border:1px solid rgba(255,197,0,.35);
+  background: rgba(255,197,0,.08);
+  color: rgba(255,222,140,.95);
+  font-size:12px;
+  line-height:1.5;
+  padding:8px 10px;
+}
 
 .splitBoard{
   display:none;
@@ -614,6 +624,38 @@ a.btn{text-decoration:none}
   font-size:12px;
   color: var(--faint);
   white-space: nowrap;
+}
+
+.splitPromptList{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap:12px;
+}
+.splitPromptCard{
+  border:1px solid var(--stroke);
+  border-radius:18px;
+  background: rgba(0,0,0,.16);
+  padding:12px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.splitPromptHeader{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+}
+.splitPromptTitle{
+  font-weight:800;
+  font-size:12px;
+  letter-spacing:.2px;
+}
+.splitPromptInput{
+  min-height:180px;
+}
+.splitPromptPreview{
+  min-height:140px;
 }
 
 .jobs{

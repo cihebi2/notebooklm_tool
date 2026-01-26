@@ -26,8 +26,8 @@ def concat_audio(parts: list[Path], output_path: Path, output_format: str = "mp3
         raise RuntimeError("ffmpeg not found in PATH (required for stitching)")
 
     output_format = (output_format or "").strip().lower()
-    if output_format not in {"mp3", "mp4"}:
-        raise ValueError("split_output_format must be mp3 or mp4")
+    if output_format not in {"mp3", "mp4", "m4a"}:
+        raise ValueError("split_output_format must be mp3, mp4, or m4a")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -51,4 +51,3 @@ def concat_audio(parts: list[Path], output_path: Path, output_format: str = "mp3
         raise RuntimeError(f"ffmpeg stitch failed: {err}")
 
     return ConcatResult(output_path=output_path, method="ffmpeg_concat_filter")
-

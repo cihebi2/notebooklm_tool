@@ -101,6 +101,7 @@
                   <div id="progressFill" class="progressFill"></div>
                 </div>
               </div>
+              <div id="progressWarning" class="progressWarning" style="display:none"></div>
 
               <div id="splitBoard" class="splitBoard" style="margin-top:10px"></div>
               <div id="inflight" class="inflight" style="margin-top:10px"></div>
@@ -284,7 +285,8 @@
               <div class="field">
                 <label>拼接输出</label>
                 <select id="splitOutputFormat">
-                  <option value="mp3" selected>MP3（推荐）</option>
+                  <option value="m4a" selected>M4A (default)</option>
+                  <option value="mp3">MP3</option>
                   <option value="mp4">MP4</option>
                 </select>
               </div>
@@ -438,6 +440,20 @@
               <label>提示词预览（已替换日期）</label>
               <textarea id="promptPreview" readonly style="min-height:180px"></textarea>
               <div class="hint">这是实际发送给 NotebookLM 的完整提示词（固定 + 追加）。</div>
+            </div>
+
+            <div id="splitPromptSection" class="field" style="margin-top:14px">
+              <label>分段固定提示词（仅分段拼接使用）</label>
+              <div class="btnRow" style="margin-top:6px">
+                <button id="saveSplitPromptBtn" class="btn">保存分段提示词</button>
+                <button id="loadSplitPromptBtn" class="btn ghost" type="button">加载分段提示词</button>
+                <button id="resetSplitPromptBtn" class="btn ghost" type="button">恢复分段模板</button>
+              </div>
+              <div class="hint" style="margin-top:6px">
+                支持日期变量：<code>{{TODAY}}</code> / <code>{{TOMORROW}}</code>。开启分段后会对每段单独应用。
+              </div>
+              <div id="splitPromptSavedAt" class="hint" style="margin-top:6px"></div>
+              <div id="splitPromptList" class="splitPromptList" style="margin-top:10px"></div>
             </div>
           </div>
         </section>
