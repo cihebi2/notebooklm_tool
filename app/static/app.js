@@ -15,6 +15,7 @@ const state = {
   inflight: {},
   parts: {},
   splitInfo: null,
+  stitch: null,
 };
 
 const STORAGE_LAST_JOB = "notebooklm.lastJobId";
@@ -25,6 +26,8 @@ const STORAGE_USE_FIXED_INSTRUCTIONS = "notebooklm.useFixedInstructions";
 const STORAGE_PROMPT_PRESET = "notebooklm.promptPreset";
 const STORAGE_PROMPT_NAME = "notebooklm.promptName";
 const STORAGE_SPLIT_PARTS = "notebooklm.splitPartPrompts";
+const STORAGE_SPLIT_CANDIDATES = "notebooklm.splitCandidatesPerPart";
+const STORAGE_LAST_RUN_CONFIG = "notebooklm.lastRunConfig";
 const STALL_WARNING_MS = 20 * 60 * 1000;
 
 function persistLastJobId(jobId){
@@ -56,6 +59,131 @@ function readRunTab(){
     return localStorage.getItem(STORAGE_RUN_TAB);
   }catch{
     return null;
+  }
+}
+
+function _readJSON(key, fallback=null){
+  try{
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  }catch{
+    return fallback;
+  }
+}
+
+function _writeJSON(key, value){
+  try{
+    localStorage.setItem(key, JSON.stringify(value));
+  }catch{}
+}
+
+function collectLastRunConfig(){
+  const picked = [];
+  for (const cb of $$("#accountsList input[type=checkbox]")){
+    const id = cb.dataset.accountId;
+    const attempts = $(`#accountsList input[data-attempts-for="${id}"]`);
+    picked.push({
+      account_id: id,
+      checked: !!cb.checked,
+      max_attempts: parseInt(attempts?.value || "20",10),
+    });
+  }
+
+  const segs = _getSplitSegments();
+  return {
+    v: 1,
+    accounts: picked,
+    target_successes: parseInt($("#targetCount")?.value || "1",10),
+    target_mode: ($("#targetMode")?.value || "accepted"),
+    min_duration_minutes: parseFloat($("#minMinutes")?.value || "40"),
+    split_enabled: !!$("#splitEnabled")?.checked,
+    split_parallel_ui: !!$("#splitParallel")?.checked,
+    split_segments: segs,
+    split_min_duration_minutes: parseFloat($("#splitMinMinutes")?.value || "15"),
+    split_output_format: $("#splitOutputFormat")?.value || "m4a",
+    split_keep_parts: !!$("#splitKeepParts")?.checked,
+    split_manual_stitch: !!$("#splitManualStitch")?.checked,
+    split_candidates_per_part: _normalizeSplitCandidates(_readSplitCandidates(), segs),
+    language: $("#lang")?.value || "zh",
+    audio_length: $("#audioLength")?.value || "long",
+    audio_format: $("#audioFormat")?.value || "deep_dive",
+    accounts_concurrency: parseInt($("#accConcurrency")?.value || "4",10),
+    per_account_concurrency: parseInt($("#perAccConcurrency")?.value || "2",10),
+    keep_short_files: !!$("#keepShort")?.checked,
+    delete_short_artifacts: !!$("#deleteShort")?.checked,
+    silence_check_enabled: !!$("#silenceCheckEnabled")?.checked,
+    silence_min_duration_s: parseFloat($("#silenceMinSeconds")?.value || "5"),
+    silence_threshold_db: parseFloat($("#silenceThreshold")?.value || "-50"),
+  };
+}
+
+function persistLastRunConfig(){
+  _writeJSON(STORAGE_LAST_RUN_CONFIG, collectLastRunConfig());
+}
+
+function restoreLastRunConfig(){
+  const cfg = _readJSON(STORAGE_LAST_RUN_CONFIG, null);
+  if (!cfg || typeof cfg !== "object") return false;
+
+  try{
+    if ($("#targetCount") && cfg.target_successes != null) $("#targetCount").value = String(cfg.target_successes);
+    if ($("#targetMode") && cfg.target_mode) $("#targetMode").value = String(cfg.target_mode);
+    if ($("#minMinutes") && cfg.min_duration_minutes != null) $("#minMinutes").value = String(cfg.min_duration_minutes);
+
+    if ($("#splitEnabled")) $("#splitEnabled").checked = !!cfg.split_enabled;
+    if ($("#splitParallel")) $("#splitParallel").checked = (cfg.split_parallel_ui != null) ? !!cfg.split_parallel_ui : !!cfg.split_parallel;
+    if ($("#splitSegments") && cfg.split_segments != null) $("#splitSegments").value = String(cfg.split_segments);
+    if ($("#splitMinMinutes") && cfg.split_min_duration_minutes != null) $("#splitMinMinutes").value = String(cfg.split_min_duration_minutes);
+    if ($("#splitOutputFormat") && cfg.split_output_format) $("#splitOutputFormat").value = String(cfg.split_output_format);
+    if ($("#splitKeepParts")) $("#splitKeepParts").checked = !!cfg.split_keep_parts;
+    if ($("#splitManualStitch")) $("#splitManualStitch").checked = !!cfg.split_manual_stitch;
+
+    const segs = _getSplitSegments();
+    if (Array.isArray(cfg.split_candidates_per_part)){
+      _writeSplitCandidates(_normalizeSplitCandidates(cfg.split_candidates_per_part, segs));
+    }
+    renderSplitPromptList();
+    updateSplitPromptPreview();
+
+    if ($("#lang") && cfg.language) $("#lang").value = String(cfg.language);
+    if ($("#audioLength") && cfg.audio_length) $("#audioLength").value = String(cfg.audio_length);
+    if ($("#audioFormat") && cfg.audio_format) $("#audioFormat").value = String(cfg.audio_format);
+    if ($("#accConcurrency") && cfg.accounts_concurrency != null) $("#accConcurrency").value = String(cfg.accounts_concurrency);
+    if ($("#perAccConcurrency") && cfg.per_account_concurrency != null) $("#perAccConcurrency").value = String(cfg.per_account_concurrency);
+
+    if ($("#keepShort")) $("#keepShort").checked = !!cfg.keep_short_files;
+    if ($("#deleteShort")) $("#deleteShort").checked = !!cfg.delete_short_artifacts;
+    if ($("#silenceCheckEnabled")) $("#silenceCheckEnabled").checked = (cfg.silence_check_enabled !== false);
+    if ($("#silenceMinSeconds") && cfg.silence_min_duration_s != null){
+      $("#silenceMinSeconds").value = String(cfg.silence_min_duration_s);
+    }
+    if ($("#silenceThreshold") && cfg.silence_threshold_db != null){
+      $("#silenceThreshold").value = String(cfg.silence_threshold_db);
+    }
+
+    const byId = new Map();
+    if (Array.isArray(cfg.accounts)){
+      for (const a of cfg.accounts){
+        if (!a?.account_id) continue;
+        byId.set(String(a.account_id), a);
+      }
+    }
+    for (const cb of $$("#accountsList input[type=checkbox]")){
+      const id = String(cb.dataset.accountId || "");
+      const a = byId.get(id);
+      if (!a) continue;
+      cb.checked = !!a.checked;
+      const attempts = $(`#accountsList input[data-attempts-for="${id}"]`);
+      if (attempts && a.max_attempts != null){
+        attempts.value = String(a.max_attempts);
+      }
+    }
+
+    $("#targetMode")?.dispatchEvent(new Event("change"));
+    return true;
+  }catch{
+    return false;
   }
 }
 
@@ -151,15 +279,16 @@ function fmtTs(ts){
 
 function tagFor(type){
   if (type === "warn") return ["WARN","warn"];
-  if (["accepted","job_completed","part_accepted","stitch_completed"].includes(type)) return ["OK","good"];
+  if (["accepted","job_completed","part_accepted","stitch_completed","silence_ok","part_silence_ok"].includes(type)) return ["OK","good"];
   if ([
     "rejected","attempt_error","account_error","job_failed","generation_failed",
-    "part_attempt_error","part_generation_failed","split_failed","stitch_rejected"
+    "part_attempt_error","part_generation_failed","split_failed","stitch_rejected",
+    "silence_rejected","part_silence_rejected","silence_check_failed","part_silence_check_failed"
   ].includes(type)) return ["ERR","bad"];
   if ([
     "job_started","generation_started","downloaded","source_ready","notebook_created","attempt_started","job_queued",
     "split_detected","split_source_ready","part_attempt_started","part_generation_started","part_downloaded","part_rejected","stitch_started",
-    "source_fallback_file"
+    "source_fallback_file","split_waiting_selection","split_stitch_selection_submitted","split_stitch_selection_received"
   ].includes(type)) return ["RUN","warn"];
   return ["INFO",""];
 }
@@ -185,18 +314,57 @@ function lineText(ev){
     case "source_fallback_file": return `${a} source 导入失败，已改用文件上传：${ev.error || ""}${errSuffix(ev)}`;
     case "generation_started": return `${a} 第 ${ev.attempt} 次生成开始 (task ${ev.task_id.slice(0,8)}…)`;
     case "generation_failed": return `${a} 生成失败: ${ev.error_code || ""} ${ev.error || ""}`;
-    case "split_detected": return `${a} 分段模式：检测到 ${ev.detected_items ?? "?"} 条，拆分为 ${ev.segments} 段（每段阈值 ${ev.min_part_minutes} min）`;
+    case "split_detected": {
+      const cps = Array.isArray(ev.candidates_per_part)
+        ? ev.candidates_per_part.map(v => {
+          const n = parseInt(String(v ?? "1"),10);
+          if (!Number.isFinite(n) || n < 0) return 1;
+          return Math.min(n, 20);
+        })
+        : null;
+      const candTxt = cps ? ` · 候选 ${cps.join(",")}` : "";
+      return `${a} 分段模式：检测到 ${ev.detected_items ?? "?"} 条，拆分为 ${ev.segments} 段（每段阈值 ${ev.min_part_minutes} min${candTxt}）`;
+    }
     case "split_source_ready": return `${a} 第 ${ev.part} 段 source 已导入${ev.source_method ? ` (${ev.source_method})` : ""}`;
     case "part_attempt_started": return `${a} 第 ${ev.part} 段 · 第 ${ev.attempt} 次尝试`;
     case "part_generation_started": return `${a} 第 ${ev.part} 段生成开始 (task ${ev.task_id.slice(0,8)}…)`;
     case "part_generation_failed": return `${a} 第 ${ev.part} 段生成失败: ${ev.error_code || ""} ${ev.error || ""}`;
     case "part_downloaded": return `${a} 第 ${ev.part} 段已下载，时长 ${ev.duration_minutes} min (${ev.duration_method})`;
-    case "part_accepted": return `${a} 第 ${ev.part} 段 ✅ 达标：${ev.duration_minutes} min`;
+    case "part_silence_ok":
+      return `${a} 第 ${ev.part} 段静音检测通过（阈值 ${ev.threshold_db}dB / ${ev.min_silence_duration_s}s）`;
+    case "part_silence_rejected": {
+      const count = Number(ev.segments_count || 0);
+      const seg = Array.isArray(ev.segments) && ev.segments.length ? ev.segments[0] : null;
+      const pos = seg ? `（首段 ${seg.start_hhmmss}→${seg.end_hhmmss}）` : "";
+      const ctxt = Number.isFinite(count) && count > 0 ? `（静音段 ${count} 处）` : "";
+      return `${a} 第 ${ev.part} 段静音超标，作废${ctxt}${pos}`;
+    }
+    case "part_accepted": {
+      const got = Number(ev.candidates_collected);
+      const req = Number(ev.candidates_required);
+      const suffix = (Number.isFinite(got) && Number.isFinite(req) && req > 0) ? `（候选 ${got}/${req}）` : "";
+      return `${a} 第 ${ev.part} 段 ✅ 达标：${ev.duration_minutes} min${suffix}`;
+    }
     case "part_rejected": return `${a} 第 ${ev.part} 段 ⛔ 太短：${ev.duration_minutes} min (阈值 ${ev.min_duration_minutes} min)`;
     case "stitch_started": return `${a} 开始拼接 ${ev.parts?.length || ""} 段 → ${ev.output || ""}`;
     case "stitch_completed": return `${a} 拼接完成：${ev.duration_minutes} min (${ev.method || ""})`;
     case "stitch_rejected": return `${a} 拼接后仍太短：${ev.duration_minutes} min (阈值 ${ev.min_duration_minutes} min)`;
+    case "silence_ok":
+      return `${a} 静音检测通过（阈值 ${ev.threshold_db}dB / ${ev.min_silence_duration_s}s）`;
+    case "silence_rejected": {
+      const count = Number(ev.segments_count || 0);
+      const seg = Array.isArray(ev.segments) && ev.segments.length ? ev.segments[0] : null;
+      const pos = seg ? `（首段 ${seg.start_hhmmss}→${seg.end_hhmmss}）` : "";
+      const ctxt = Number.isFinite(count) && count > 0 ? `（静音段 ${count} 处）` : "";
+      return `${a} 静音超标，作废${ctxt}${pos}`;
+    }
+    case "part_silence_check_failed":
+    case "silence_check_failed":
+      return `${a} 静音检测失败：${ev.error || ""}`;
     case "split_failed": return `${a} 分段失败: ${ev.error || ""}`;
+    case "split_waiting_selection": return `等待手动选择拼接文件（第 ${ev.episode || 1} 期）`;
+    case "split_stitch_selection_submitted": return `已提交拼接选择（第 ${ev.episode || 1} 期）`;
+    case "split_stitch_selection_received": return `已收到拼接选择，开始拼接…（第 ${ev.episode || 1} 期）`;
     case "part_attempt_error": return `${a} 第 ${ev.part} 段尝试出错: ${ev.error || ""}${errSuffix(ev)}`;
     case "downloaded": {
       const mode = String(ev.target_mode || "");
@@ -230,7 +398,7 @@ function setBadge(status){
   const dot = $("#statusDot");
   const label = $("#statusLabel");
   dot.className = "dot";
-  if (status === "running") dot.classList.add("running");
+  if (status === "running" || status === "queued" || status === "waiting_selection") dot.classList.add("running");
   if (status === "completed") dot.classList.add("good");
   if (status === "failed") dot.classList.add("bad");
   label.textContent = status || "idle";
@@ -249,7 +417,7 @@ function setJobStats(job){
     $("#jobSuccess").textContent = `达标 ${accepted}/${target}`;
   }
   $("#jobChars").textContent = job?.report_char_count ?? "-";
-  setBadge(job?.state === "running" ? "running" : (job?.state || "idle"));
+  setBadge(job?.state || "idle");
 
   const exportLink = $("#exportLogLink");
   if (exportLink){
@@ -326,10 +494,12 @@ function resetDerivedState(){
   state.inflight = {};
   state.parts = {};
   state.splitInfo = null;
+  state.stitch = null;
   renderLive();
   renderInflight();
   renderSplitBoard();
   renderProgressWarning();
+  renderStitchPanel();
 }
 
 function fmtElapsedMs(ms){
@@ -468,7 +638,9 @@ function renderSplitBoard(){
   box.style.display = "grid";
   box.innerHTML = "";
   for (let i=1;i<=segs;i++){
-    const p = state.parts?.[i] || {status:"waiting", attempts:0, inflight:0, best_minutes:null};
+    const p = state.parts?.[i] || {status:"waiting", attempts:0, inflight:0, best_minutes:null, accepted:0, required:1};
+    const req = Number(p.required ?? 1);
+    const skipped = Number.isFinite(req) && req === 0;
 
     const card = document.createElement("div");
     card.className = "partCard";
@@ -492,9 +664,15 @@ function renderSplitBoard(){
 
     const meta = document.createElement("div");
     meta.className = "hint";
-    const best = Number(p.best_minutes);
-    const bestTxt = Number.isFinite(best) ? `${best.toFixed(2).replace(/\\.00$/,"")} min` : "-";
-    meta.textContent = `尝试 ${p.attempts || 0} · 进行中 ${p.inflight || 0} · 最长 ${bestTxt}`;
+    if (skipped){
+      meta.textContent = "已跳过（候选数=0）";
+    } else {
+      const best = Number(p.best_minutes);
+      const bestTxt = Number.isFinite(best) ? `${best.toFixed(2).replace(/\\.00$/,"")} min` : "-";
+      const acc = Number(p.accepted ?? 0);
+      const ar = (Number.isFinite(acc) && Number.isFinite(req)) ? `${acc}/${req}` : "-";
+      meta.textContent = `达标 ${ar} · 尝试 ${p.attempts || 0} · 进行中 ${p.inflight || 0} · 最长 ${bestTxt}`;
+    }
 
     card.append(top, meta);
     box.append(card);
@@ -508,7 +686,7 @@ function _ensureSplitParts(segments){
   if (!state.parts || typeof state.parts !== "object") state.parts = {};
   for (let i=1;i<=n;i++){
     if (!state.parts[i]){
-      state.parts[i] = {status:"waiting", attempts:0, inflight:0, best_minutes:null};
+      state.parts[i] = {status:"waiting", attempts:0, inflight:0, best_minutes:null, accepted:0, required:1};
     }
   }
 }
@@ -516,7 +694,7 @@ function _ensureSplitParts(segments){
 function _partState(idx){
   const i = Number(idx);
   if (!Number.isFinite(i) || i <= 0) return null;
-  if (!state.parts[i]) state.parts[i] = {status:"waiting", attempts:0, inflight:0, best_minutes:null};
+  if (!state.parts[i]) state.parts[i] = {status:"waiting", attempts:0, inflight:0, best_minutes:null, accepted:0, required:1};
   return state.parts[i];
 }
 
@@ -528,6 +706,20 @@ function updateDerivedFromEvent(ev, opts={}){
   if (ev.type === "split_detected"){
     state.parts = {};
     _ensureSplitParts(ev.segments);
+    const segs = Number(ev.segments || 0);
+    const cands = Array.isArray(ev.candidates_per_part) ? ev.candidates_per_part : [];
+    for (let i=1;i<=segs;i++){
+      const p = _partState(i);
+      if (!p) continue;
+      p.accepted = 0;
+      const n = parseInt(String(cands[i-1] ?? "1"), 10);
+      let req = (Number.isFinite(n) && n >= 0) ? Math.min(n, 20) : 1;
+      if (req < 0) req = 1;
+      p.required = req;
+      p.status = (req === 0) ? "skipped" : "waiting";
+    }
+    state.stitch = null;
+    renderStitchPanel?.();
     renderSplitBoard();
   }
 
@@ -566,7 +758,7 @@ function updateDerivedFromEvent(ev, opts={}){
           started_ts: ev.ts,
         };
       }
-      if (["part_downloaded","part_generation_failed","part_attempt_error","part_rejected","part_accepted"].includes(ev.type) && ev.task_id){
+      if (["part_downloaded","part_generation_failed","part_attempt_error","part_rejected","part_silence_rejected","part_accepted"].includes(ev.type) && ev.task_id){
         if (p.inflight > 0) p.inflight -= 1;
         delete state.inflight[String(ev.task_id)];
       }
@@ -578,14 +770,21 @@ function updateDerivedFromEvent(ev, opts={}){
         }
       }
       if (ev.type === "part_accepted"){
-        p.status = "accepted";
+        const req = Number(ev.candidates_required);
+        const got = Number(ev.candidates_collected);
+        if (Number.isFinite(req) && req > 0) p.required = req;
+        if (Number.isFinite(got) && got >= 0) p.accepted = got;
+        else p.accepted = Number(p.accepted||0) + 1;
+
+        if (Number(p.accepted||0) >= Number(p.required||1)) p.status = "accepted";
+        else p.status = "running";
         const m = Number(ev.duration_minutes);
         if (Number.isFinite(m)){
           if (!Number.isFinite(Number(p.best_minutes))) p.best_minutes = m;
           else p.best_minutes = Math.max(Number(p.best_minutes), m);
         }
       }
-      if (ev.type === "part_attempt_error" || ev.type === "part_generation_failed"){
+      if (ev.type === "part_attempt_error" || ev.type === "part_generation_failed" || ev.type === "part_silence_rejected"){
         if (p.status !== "accepted") p.status = "retrying";
       }
     }
@@ -593,12 +792,24 @@ function updateDerivedFromEvent(ev, opts={}){
 
   if (["job_completed","job_failed","job_cancelled"].includes(ev.type)){
     state.inflight = {};
+    state.stitch = null;
+    renderStitchPanel?.();
+  }
+
+  if (ev.type === "split_waiting_selection"){
+    state.stitch = ev;
+    renderStitchPanel?.();
+  }
+  if (ev.type === "split_stitch_selection_received"){
+    state.stitch = null;
+    renderStitchPanel?.();
   }
 
   if (doRender){
     renderInflight();
     renderSplitBoard();
     renderProgressWarning();
+    renderStitchPanel?.();
   }
 }
 
@@ -660,6 +871,16 @@ function renderFiles(job){
 
     nameLine.append(a, pill);
 
+    const silence = String(f.silence || "");
+    if (silence){
+      const sp = document.createElement("span");
+      sp.className = "pill";
+      if (silence === "ok") sp.classList.add("good");
+      else if (silence === "fail") sp.classList.add("bad");
+      sp.textContent = silence === "ok" ? "静音OK" : "静音FAIL";
+      nameLine.append(sp);
+    }
+
     const meta = document.createElement("div");
     meta.className = "meta";
     const parts = [fmtBytes(f.size)];
@@ -671,6 +892,15 @@ function renderFiles(job){
       if (m) parts.push(`~${m[1]} min`);
     }
     if (f.account_name) parts.push(`@${f.account_name}`);
+    if (silence){
+      const db = f.silence_threshold_db;
+      const smin = f.silence_min_duration_s;
+      if (db != null && smin != null){
+        parts.push(`静音${silence === "ok" ? "OK" : "FAIL"} (${db}dB/${smin}s)`);
+      } else {
+        parts.push(`静音${silence === "ok" ? "OK" : "FAIL"}`);
+      }
+    }
     meta.textContent = parts.join(" · ");
 
     top.append(nameLine, meta);
@@ -711,6 +941,132 @@ function renderFiles(job){
   }
 }
 
+function renderStitchPanel(){
+  const box = $("#stitchPanel");
+  if (!box) return;
+  const job = state.job;
+  const st = state.stitch;
+  const splitEnabled = !!job?.config?.split_enabled;
+
+  if (!job || !splitEnabled || !st || String(st.type || "") !== "split_waiting_selection"){
+    box.style.display = "none";
+    box.innerHTML = "";
+    return;
+  }
+
+  const episode = Number(st.episode || 1);
+  const segs = Number(st.segments || job?.config?.split_segments || 0);
+  const requiredByPart = (st.required_by_part && typeof st.required_by_part === "object") ? st.required_by_part : {};
+  const candidatesByPart = (st.candidates_by_part && typeof st.candidates_by_part === "object") ? st.candidates_by_part : {};
+
+  const getKey = (obj, key) => (obj?.[key] ?? obj?.[String(key)]);
+  const picks = {};
+
+  box.style.display = "block";
+  box.innerHTML = "";
+
+  const title = document.createElement("div");
+  title.className = "stitchTitle";
+  title.textContent = "等待你选择拼接文件";
+
+  const hint = document.createElement("div");
+  hint.className = "hint";
+  hint.textContent = "先试听下面的候选音频，再为每段选择一个版本，然后点击“开始拼接”。";
+
+  const grid = document.createElement("div");
+  grid.className = "stitchGrid";
+  const enabledParts = [];
+
+  for (let i=1;i<=segs;i++){
+    const cell = document.createElement("div");
+    cell.className = "stitchCell";
+
+    const head = document.createElement("div");
+    head.className = "hint";
+    const req = parseInt(String(getKey(requiredByPart, i) ?? "1"), 10);
+    const reqOk = Number.isFinite(req) && req >= 0 ? req : 1;
+    if (reqOk <= 0){
+      head.textContent = `第 ${i} 段 · 跳过（候选数=0）`;
+      const sub = document.createElement("div");
+      sub.className = "hint";
+      sub.textContent = "无需选择";
+      cell.append(head, sub);
+      grid.append(cell);
+      continue;
+    }
+    enabledParts.push(i);
+    head.textContent = `第 ${i} 段 · 需要 ${reqOk} 条候选`;
+
+    const sel = document.createElement("select");
+    const raw = getKey(candidatesByPart, i);
+    const list = Array.isArray(raw) ? raw.slice() : [];
+    list.sort((a,b) => Number(b?.duration_minutes||0) - Number(a?.duration_minutes||0));
+    if (!list.length){
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "暂无候选（请稍等）";
+      sel.append(opt);
+      sel.disabled = true;
+    }else{
+      for (const c of list){
+        const file = String(c?.file || "");
+        const dm = Number(c?.duration_minutes);
+        const who = c?.account_name ? `@${c.account_name}` : "";
+        const opt = document.createElement("option");
+        opt.value = file;
+        const dmTxt = Number.isFinite(dm) ? `${dm.toFixed(2).replace(/\\.00$/,"")} min` : "-";
+        opt.textContent = `${dmTxt} · ${who} · ${file}`.replace(/\\s+·\\s+·/g," · ");
+        sel.append(opt);
+      }
+      picks[i] = sel.value;
+      sel.addEventListener("change", () => { picks[i] = sel.value; });
+    }
+
+    cell.append(head, sel);
+    grid.append(cell);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "stitchActions";
+
+  const btn = document.createElement("button");
+  btn.className = "btn primary";
+  btn.type = "button";
+  btn.textContent = "开始拼接";
+  btn.addEventListener("click", async () => {
+    const parts = {};
+    for (const i of enabledParts){
+      const v = String(picks[i] || "");
+      if (!v){
+        alert(`第 ${i} 段还没有可用候选`);
+        return;
+      }
+      parts[String(i)] = v;
+    }
+    btn.disabled = true;
+    btn.textContent = "提交中…";
+    try{
+      const res = await fetch(`/api/jobs/${encodeURIComponent(job.id)}/stitch`, {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({episode, parts}),
+      });
+      if (!res.ok){
+        throw new Error(await res.text());
+      }
+      btn.textContent = "已提交，等待拼接…";
+      setRunTab("live");
+    }catch(e){
+      btn.disabled = false;
+      btn.textContent = "开始拼接";
+      alert(`提交失败：${String(e)}`);
+    }
+  });
+
+  actions.append(btn);
+  box.append(title, hint, grid, actions);
+}
+
 function renderJobs(){
   const box = $("#jobs");
   if (!box) return;
@@ -743,7 +1099,7 @@ function renderJobs(){
     const st = String(j?.state || "-");
     if (st === "completed") pill.classList.add("good");
     else if (st === "failed" || st === "cancelled") pill.classList.add("bad");
-    else if (st === "running" || st === "queued") pill.classList.add("warn");
+    else if (st === "running" || st === "queued" || st === "waiting_selection") pill.classList.add("warn");
     pill.textContent = st;
 
     top.append(left, pill);
@@ -850,7 +1206,7 @@ async function loadJob(jobId, opts={}){
       renderSplitBoard();
     }
 
-    const running = (job?.state === "running" || job?.state === "queued");
+    const running = (job?.state === "running" || job?.state === "queued" || job?.state === "waiting_selection");
     $("#startBtn").disabled = running;
     $("#cancelBtn").disabled = !running;
     if (running){
@@ -1099,6 +1455,27 @@ function _writeSplitParts(parts){
   }catch{}
 }
 
+function _readSplitCandidates(){
+  try{
+    const raw = localStorage.getItem(STORAGE_SPLIT_CANDIDATES);
+    const parsed = JSON.parse(raw || "[]");
+    if (Array.isArray(parsed)){
+      return parsed.map(v => {
+        const n = parseInt(String(v ?? "1"), 10);
+        if (!Number.isFinite(n) || n < 0) return 1;
+        return Math.min(n, 20);
+      });
+    }
+  }catch{}
+  return [];
+}
+
+function _writeSplitCandidates(cands){
+  try{
+    localStorage.setItem(STORAGE_SPLIT_CANDIDATES, JSON.stringify(cands || []));
+  }catch{}
+}
+
 function _getSplitSegments(){
   const n = parseInt($("#splitSegments")?.value || "3", 10);
   return Number.isFinite(n) && n > 0 ? n : 3;
@@ -1107,6 +1484,17 @@ function _getSplitSegments(){
 function _normalizeSplitParts(parts, segments){
   const out = Array.isArray(parts) ? parts.slice(0, segments) : [];
   while (out.length < segments) out.push("");
+  return out;
+}
+
+function _normalizeSplitCandidates(cands, segments){
+  const out = Array.isArray(cands) ? cands.slice(0, segments) : [];
+  for (let i = 0; i < out.length; i++){
+    const n = parseInt(String(out[i] ?? "1"), 10);
+    if (!Number.isFinite(n) || n < 0) out[i] = 1;
+    else out[i] = Math.min(n, 20);
+  }
+  while (out.length < segments) out.push(1);
   return out;
 }
 
@@ -1127,7 +1515,9 @@ function renderSplitPromptList(){
 
   const segments = _getSplitSegments();
   const parts = _normalizeSplitParts(_readSplitParts(), segments);
+  const cands = _normalizeSplitCandidates(_readSplitCandidates(), segments);
   _writeSplitParts(parts);
+  _writeSplitCandidates(cands);
 
   box.innerHTML = "";
   for (let i = 1; i <= segments; i++){
@@ -1141,11 +1531,36 @@ function renderSplitPromptList(){
     title.className = "splitPromptTitle";
     title.textContent = `第 ${i} 段提示词`;
 
+    const controls = document.createElement("div");
+    controls.className = "splitPromptControls";
+
+    const candCtl = document.createElement("div");
+    candCtl.className = "splitCandidateCtl";
+    const candHint = document.createElement("div");
+    candHint.className = "hint";
+    candHint.textContent = "候选数";
+    const candInput = document.createElement("input");
+    candInput.className = "splitCandidateInput";
+    candInput.type = "number";
+    candInput.min = "0";
+    candInput.max = "20";
+    candInput.value = String(cands[i - 1] ?? 1);
+    candInput.dataset.part = String(i);
+    candInput.addEventListener("input", () => {
+      const next = _normalizeSplitCandidates(_readSplitCandidates(), segments);
+      const n = parseInt(String(candInput.value || "1"), 10);
+      if (!Number.isFinite(n) || n < 0) next[i - 1] = 1;
+      else next[i - 1] = Math.min(n, 20);
+      _writeSplitCandidates(_normalizeSplitCandidates(next, segments));
+    });
+    candCtl.append(candHint, candInput);
+
     const pill = document.createElement("span");
     pill.className = "pill";
     pill.textContent = `Part ${i}/${segments}`;
 
-    header.append(title, pill);
+    controls.append(candCtl, pill);
+    header.append(title, controls);
 
     const input = document.createElement("textarea");
     input.className = "splitPromptInput";
@@ -1256,6 +1671,7 @@ function resetSplitPrompt(){
     defaults.push(DEFAULT_SPLIT_TEMPLATES[i] || "");
   }
   _writeSplitParts(defaults);
+  _writeSplitCandidates(Array.from({length: segments}, () => 1));
   renderSplitPromptList();
   updateSplitPromptPreview();
   const el = $("#splitPromptSavedAt");
@@ -2137,6 +2553,12 @@ function collectConfig(){
     split_min_duration_minutes: parseFloat($("#splitMinMinutes").value || "15"),
     split_output_format: $("#splitOutputFormat").value,
     split_keep_parts: $("#splitKeepParts").checked,
+    split_manual_stitch: ($("#splitEnabled").checked && $("#splitManualStitch").checked),
+    split_candidates_per_part: (() => {
+      if (!$("#splitEnabled").checked) return [];
+      const segments = _getSplitSegments();
+      return _normalizeSplitCandidates(_readSplitCandidates(), segments);
+    })(),
     split_part_instructions: (() => {
       if (!$("#splitEnabled").checked) return [];
       const segments = _getSplitSegments();
@@ -2164,8 +2586,11 @@ function collectConfig(){
       const raw = fixedEnabled ? mergeText(fixed, extra) : String(extra || "").trim();
       return applyDateTokens(raw);
     })(),
-    per_account_concurrency: parseInt($("#perAccConcurrency").value || "1",10),
-    accounts_concurrency: parseInt($("#accConcurrency").value || "2",10),
+    per_account_concurrency: parseInt($("#perAccConcurrency").value || "2",10),
+    accounts_concurrency: parseInt($("#accConcurrency").value || "4",10),
+    silence_check_enabled: !!$("#silenceCheckEnabled")?.checked,
+    silence_min_duration_s: parseFloat($("#silenceMinSeconds")?.value || "5"),
+    silence_threshold_db: parseFloat($("#silenceThreshold")?.value || "-50"),
     keep_short_files: $("#keepShort").checked,
     delete_short_artifacts: $("#deleteShort").checked,
   };
@@ -2179,6 +2604,7 @@ async function startJob(){
 
   try{
     const cfg = collectConfig();
+    persistLastRunConfig();
 
     const fd = new FormData();
     fd.append("config", JSON.stringify(cfg));
@@ -2233,6 +2659,7 @@ function connectSSE(jobId){
       renderLive();
       renderInflight();
       renderSplitBoard();
+      renderStitchPanel();
       return;
     }
     addLog(ev);
@@ -2243,6 +2670,7 @@ function connectSSE(jobId){
       state.job = await r.json();
       setJobStats(state.job);
       renderFiles(state.job);
+      renderStitchPanel();
       $("#startBtn").disabled = false;
       $("#cancelBtn").disabled = true;
       sse.close();
@@ -2263,6 +2691,7 @@ function connectSSE(jobId){
       state.job = await r.json();
       setJobStats(state.job);
       renderFiles(state.job);
+      renderStitchPanel();
       refreshJobs?.();
     }
   };
@@ -2485,6 +2914,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireCounters();
   wireTargetMode();
   await refreshAccounts();
+  restoreLastRunConfig();
   await refreshBrowserProfiles();
   await initLoginSession();
   await hydrateLastJob();

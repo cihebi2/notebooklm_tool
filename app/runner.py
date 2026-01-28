@@ -14,6 +14,7 @@ from notebooklm.types import GenerationStatus
 from .accounts_store import AccountsStore
 from .utils.audio_concat import concat_audio
 from .utils.audio_duration import get_audio_duration
+from .utils.silence_detect import detect_silence_segments, segments_to_payload
 from .utils.notebooklm_download import _extract_audio_download_url, download_audio_with_storage
 from .utils.report_split import split_report
 
@@ -197,18 +198,22 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
         target_mode = "accepted"
     min_seconds = cfg.min_duration_minutes * 60.0
     split_enabled = bool(getattr(cfg, "split_enabled", False))
-    split_parallel = bool(getattr(cfg, "split_parallel", False))
+    split_parallel = bool(getattr(cfg, "split_parallel", True))
     split_segments = int(getattr(cfg, "split_segments", 3))
     split_min_seconds = float(getattr(cfg, "split_min_duration_minutes", 15.0)) * 60.0
     split_output_format = str(getattr(cfg, "split_output_format", "m4a") or "m4a").strip().lower()
-    split_keep_parts = bool(getattr(cfg, "split_keep_parts", False))
+    split_keep_parts = bool(getattr(cfg, "split_keep_parts", True))
+    split_manual_stitch = bool(getattr(cfg, "split_manual_stitch", False))
     split_task_timeout = max(1200.0, min(3600.0, split_min_seconds * 2.0))
+    silence_check_enabled = bool(getattr(cfg, "silence_check_enabled", True))
+    silence_min_duration_s = float(getattr(cfg, "silence_min_duration_s", 5.0))
+    silence_threshold_db = float(getattr(cfg, "silence_threshold_db", -50.0))
 
     audio_length = _parse_audio_length(cfg.audio_length)
     audio_format = _parse_audio_format(cfg.audio_format)
     language = cfg.language.strip() or "en"
     instructions = (cfg.instructions or "").strip() or None
-    per_account_concurrency = max(1, int(getattr(cfg, "per_account_concurrency", 1) or 1))
+    per_account_concurrency = max(1, int(getattr(cfg, "per_account_concurrency", 2) or 2))
     delete_cancelled_artifacts = bool(getattr(cfg, "delete_cancelled_artifacts", True))
 
     semaphore = asyncio.Semaphore(cfg.accounts_concurrency)
@@ -217,11 +222,110 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
     def progress_count_unlocked() -> int:
         return job.downloads if target_mode == "downloaded" else job.successes
 
+    def normalize_split_candidates(raw: Any, segments: int) -> list[int]:
+        if segments <= 0:
+            return []
+        out: list[int] = []
+        if isinstance(raw, list):
+            for item in raw[:segments]:
+                try:
+                    n = int(item)
+                except Exception:
+                    n = 1
+                out.append(max(0, min(n, 20)))
+        while len(out) < segments:
+            out.append(1)
+        return out
+
     async def publish(event: dict[str, Any]) -> None:
         await job.publish(event)
 
+    async def check_silence(
+        *,
+        path: Path,
+        account_id: str,
+        account_name: str | None,
+        notebook_id: str,
+        task_id: str,
+        attempt: int,
+        file_name_ok: str | None = None,
+        file_name_reject: str | None = None,
+        part: int | None = None,
+        episode: int | None = None,
+    ) -> bool:
+        if not silence_check_enabled:
+            return True
+
+        try:
+            segments = await asyncio.to_thread(
+                detect_silence_segments,
+                path,
+                min_duration_s=silence_min_duration_s,
+                threshold_db=silence_threshold_db,
+            )
+        except Exception as e:
+            await publish(
+                {
+                    "type": "part_silence_check_failed" if part is not None else "silence_check_failed",
+                    "ts": _now_iso(),
+                    "account_id": account_id,
+                    "account_name": account_name,
+                    "notebook_id": notebook_id,
+                    "part": part,
+                    "episode": episode,
+                    "attempt": attempt,
+                    "task_id": task_id,
+                    "error": str(e) or type(e).__name__,
+                }
+            )
+            return True
+
+        if not segments:
+            await publish(
+                {
+                    "type": "part_silence_ok" if part is not None else "silence_ok",
+                    "ts": _now_iso(),
+                    "account_id": account_id,
+                    "account_name": account_name,
+                    "notebook_id": notebook_id,
+                    "part": part,
+                    "episode": episode,
+                    "attempt": attempt,
+                    "task_id": task_id,
+                    "file": file_name_ok,
+                    "min_silence_duration_s": silence_min_duration_s,
+                    "threshold_db": silence_threshold_db,
+                }
+            )
+            return True
+
+        payload = segments_to_payload(segments)[:20]
+        file_name = file_name_reject or file_name_ok
+        await publish(
+            {
+                "type": "part_silence_rejected" if part is not None else "silence_rejected",
+                "ts": _now_iso(),
+                "account_id": account_id,
+                "account_name": account_name,
+                "notebook_id": notebook_id,
+                "part": part,
+                "episode": episode,
+                "attempt": attempt,
+                "task_id": task_id,
+                "file": file_name,
+                "segments_count": len(segments),
+                "segments": payload,
+                "min_silence_duration_s": silence_min_duration_s,
+                "threshold_db": silence_threshold_db,
+            }
+        )
+        return False
+
     async def run_split_parallel_parts() -> None:
         plan = split_report(report_text, split_segments, include_prefix=True)
+        candidates_per_part = normalize_split_candidates(
+            getattr(cfg, "split_candidates_per_part", []), len(plan.parts)
+        )
         await publish(
             {
                 "type": "split_detected",
@@ -231,12 +335,25 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                 "segments": len(plan.parts),
                 "min_part_minutes": cfg.split_min_duration_minutes,
                 "parallel": True,
+                "candidates_per_part": candidates_per_part,
+                "manual_stitch": split_manual_stitch,
             }
         )
 
         parts_by_index = {p.index: p for p in plan.parts}
         if not parts_by_index:
             raise RuntimeError("split produced no parts")
+
+        required_by_part: dict[int, int] = {}
+        for idx in sorted(parts_by_index):
+            required_by_part[idx] = (
+                candidates_per_part[idx - 1] if 0 <= (idx - 1) < len(candidates_per_part) else 1
+            )
+        enabled_parts = [i for i in sorted(parts_by_index) if int(required_by_part.get(i, 1) or 0) > 0]
+        if not enabled_parts:
+            err = "all parts are disabled (candidates_per_part are 0)"
+            await publish({"type": "split_failed", "ts": _now_iso(), "error": err})
+            raise RuntimeError(err)
 
         account_plans: list[tuple[Any, int]] = []
         for a in cfg.accounts:
@@ -256,7 +373,9 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
         if not account_plans:
             raise RuntimeError("no valid accounts available")
 
-        async def stitch_episode(*, episode_index: int, parts_paths: list[Path]) -> tuple[Path, float]:
+        async def stitch_episode(
+            *, episode_index: int, parts_paths: list[Path], enforce_min_duration: bool
+        ) -> tuple[Path, float]:
             output_format = (
                 split_output_format if split_output_format in {"mp3", "mp4", "m4a"} else "m4a"
             )
@@ -289,7 +408,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                 }
             )
 
-            if merged_duration.seconds < min_seconds:
+            if enforce_min_duration and merged_duration.seconds < min_seconds:
                 await publish(
                     {
                         "type": "stitch_rejected",
@@ -319,9 +438,8 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             if job.is_cancelled:
                 return
 
-            results_by_part: dict[int, Path] = {}
+            candidates_by_part: dict[int, list[dict[str, Any]]] = {idx: [] for idx in parts_by_index}
             exhausted_by_part: dict[int, set[str]] = {idx: set() for idx in parts_by_index}
-            in_progress_by_part: dict[int, str | None] = {idx: None for idx in parts_by_index}
             state_lock = asyncio.Lock()
 
             done_event = asyncio.Event()
@@ -330,7 +448,10 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
 
             part_queue: asyncio.Queue[int] = asyncio.Queue()
             for idx in sorted(parts_by_index):
-                part_queue.put_nowait(idx)
+                need = max(0, int(required_by_part.get(idx, 1)))
+                for _ in range(need):
+                    part_queue.put_nowait(idx)
+            total_required = sum(max(0, int(required_by_part.get(i, 1))) for i in parts_by_index)
 
             accounts_semaphore = asyncio.Semaphore(cfg.accounts_concurrency)
 
@@ -412,25 +533,23 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                         return src, "file"
                                     raise
 
+                            source_cache: dict[int, tuple[Any, str]] = {}
+
                             while not job.is_cancelled and not done_event.is_set() and not failed_event.is_set():
                                 try:
                                     part_index = await asyncio.wait_for(part_queue.get(), timeout=1.0)
                                 except asyncio.TimeoutError:
                                     continue
 
-                                claimed = False
                                 try:
                                     async with state_lock:
-                                        if part_index in results_by_part:
-                                            continue
                                         if account.id in exhausted_by_part.get(part_index, set()):
                                             part_queue.put_nowait(part_index)
                                             continue
-                                        if in_progress_by_part.get(part_index) is not None:
-                                            part_queue.put_nowait(part_index)
+                                        have = len(candidates_by_part.get(part_index, []))
+                                        need = max(0, int(required_by_part.get(part_index, 1)))
+                                        if have >= need:
                                             continue
-                                        in_progress_by_part[part_index] = account.id
-                                        claimed = True
 
                                     part = parts_by_index.get(part_index)
                                     if not part:
@@ -448,33 +567,38 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     ).strip()
                                     content = f"{header}\n\n{part.text}".strip()
 
-                                    src, source_method = await add_source_resilient(
-                                        title=f"Morning Report Part {part.index}/{part.total}",
-                                        content=content,
-                                        file_name=(
-                                            f"{_sanitize_filename(account.name)}_ep{episode_index:02d}_"
-                                            f"part{part.index:02d}_{job.id}.txt"
-                                        ),
-                                        part=part.index,
-                                    )
-                                    await publish(
-                                        {
-                                            "type": "split_source_ready",
-                                            "ts": _now_iso(),
-                                            "account_id": account.id,
-                                            "account_name": account.name,
-                                            "notebook_id": nb.id,
-                                            "part": part.index,
-                                            "episode": episode_index,
-                                            "source_id": src.id,
-                                            "source_method": source_method,
-                                            "item_start": part.item_start,
-                                            "item_end": part.item_end,
-                                            "item_count": part.item_count,
-                                        }
-                                    )
+                                    cached = source_cache.get(part.index)
+                                    if cached is not None:
+                                        src, source_method = cached
+                                    else:
+                                        src, source_method = await add_source_resilient(
+                                            title=f"Morning Report Part {part.index}/{part.total}",
+                                            content=content,
+                                            file_name=(
+                                                f"{_sanitize_filename(account.name)}_ep{episode_index:02d}_"
+                                                f"part{part.index:02d}_{job.id}.txt"
+                                            ),
+                                            part=part.index,
+                                        )
+                                        source_cache[part.index] = (src, source_method)
+                                        await publish(
+                                            {
+                                                "type": "split_source_ready",
+                                                "ts": _now_iso(),
+                                                "account_id": account.id,
+                                                "account_name": account.name,
+                                                "notebook_id": nb.id,
+                                                "part": part.index,
+                                                "episode": episode_index,
+                                                "source_id": src.id,
+                                                "source_method": source_method,
+                                                "item_start": part.item_start,
+                                                "item_end": part.item_end,
+                                                "item_count": part.item_count,
+                                            }
+                                        )
 
-                                    accepted_path: Path | None = None
+                                    accepted_outcome: dict[str, Any] | None = None
                                     generate_lock = asyncio.Lock()
                                     task_id_by_attempt: dict[int, str] = {}
                                     attempt_by_task: dict[asyncio.Task, int] = {}
@@ -625,6 +749,40 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                     f"p{part.index:02d}_{math.floor(duration_minutes):02d}min_{task_id}.mp4"
                                                 )
                                                 final_path = job.outputs_dir / final_name
+                                                silence_name = (
+                                                    f"{_sanitize_filename(account.name)}_ep{episode_index:02d}_"
+                                                    f"p{part.index:02d}_a{attempt:02d}_silence_{task_id}.mp4"
+                                                    if cfg.keep_short_files
+                                                    else None
+                                                )
+                                                silence_ok = await check_silence(
+                                                    path=tmp_path,
+                                                    account_id=account.id,
+                                                    account_name=account.name,
+                                                    notebook_id=nb.id,
+                                                    task_id=task_id,
+                                                    attempt=attempt,
+                                                    part=part.index,
+                                                    episode=episode_index,
+                                                    file_name_ok=final_name,
+                                                    file_name_reject=silence_name,
+                                                )
+                                                if not silence_ok:
+                                                    if cfg.keep_short_files and silence_name:
+                                                        silence_path = job.outputs_dir / silence_name
+                                                        tmp_path.replace(silence_path)
+                                                        tmp_path = None
+                                                    else:
+                                                        try:
+                                                            tmp_path.unlink(missing_ok=True)
+                                                        except Exception:
+                                                            pass
+                                                    if cfg.delete_short_artifacts:
+                                                        try:
+                                                            await client.artifacts.delete(nb.id, task_id)
+                                                        except Exception:
+                                                            pass
+                                                    return None
                                                 tmp_path.replace(final_path)
                                                 tmp_path = None
                                                 return {
@@ -746,7 +904,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     active: set[asyncio.Task[dict[str, Any] | None]] = set()
 
                                     try:
-                                        while accepted_path is None and not (
+                                        while accepted_outcome is None and not (
                                             job.is_cancelled or done_event.is_set() or failed_event.is_set()
                                         ) and not switch_account:
                                             while (
@@ -802,24 +960,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                 if not outcome.get("ok"):
                                                     continue
 
-                                                accepted_path = outcome.get("path")
-                                                duration_minutes = float(outcome["duration_minutes"])
-                                                await publish(
-                                                    {
-                                                        "type": "part_accepted",
-                                                        "ts": _now_iso(),
-                                                        "account_id": account.id,
-                                                        "account_name": account.name,
-                                                        "notebook_id": nb.id,
-                                                        "part": part.index,
-                                                        "attempt": int(outcome["attempt"]),
-                                                        "episode": episode_index,
-                                                        "task_id": str(outcome["task_id"]),
-                                                        "file": str(outcome["file"]),
-                                                        "duration_minutes": round(duration_minutes, 2),
-                                                        "min_duration_minutes": cfg.split_min_duration_minutes,
-                                                    }
-                                                )
+                                                accepted_outcome = outcome
 
                                                 accepted_task_id = str(outcome.get("task_id") or "")
                                                 extra_task_ids = []
@@ -869,13 +1010,67 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                             ]
                                             await asyncio.gather(*deletes, return_exceptions=True)
 
-                                    async with state_lock:
-                                        in_progress_by_part[part_index] = None
-                                        if accepted_path is not None:
-                                            results_by_part[part_index] = accepted_path
-                                            if len(results_by_part) >= len(parts_by_index):
-                                                done_event.set()
-                                        else:
+                                    if accepted_outcome is not None:
+                                        accepted_path = accepted_outcome.get("path")
+                                        accepted_task_id = str(accepted_outcome.get("task_id") or "")
+                                        accepted_file = str(accepted_outcome.get("file") or "")
+                                        try:
+                                            accepted_attempt = int(accepted_outcome.get("attempt") or 0)
+                                        except Exception:
+                                            accepted_attempt = 0
+                                        try:
+                                            duration_minutes = float(accepted_outcome.get("duration_minutes") or 0.0)
+                                        except Exception:
+                                            duration_minutes = 0.0
+
+                                        async with state_lock:
+                                            candidates_by_part[part_index].append(
+                                                {
+                                                    "path": accepted_path,
+                                                    "file": accepted_file,
+                                                    "task_id": accepted_task_id,
+                                                    "duration_minutes": duration_minutes,
+                                                    "account_id": account.id,
+                                                    "account_name": account.name,
+                                                    "attempt": accepted_attempt,
+                                                }
+                                            )
+                                            collected = len(candidates_by_part[part_index])
+                                            required = max(0, int(required_by_part.get(part_index, 1)))
+                                            total_collected = sum(
+                                                len(candidates_by_part[i]) for i in parts_by_index
+                                            )
+                                            all_ready = all(
+                                                len(candidates_by_part[i])
+                                                >= max(0, int(required_by_part.get(i, 1)))
+                                                for i in parts_by_index
+                                            )
+
+                                        await publish(
+                                            {
+                                                "type": "part_accepted",
+                                                "ts": _now_iso(),
+                                                "account_id": account.id,
+                                                "account_name": account.name,
+                                                "notebook_id": nb.id,
+                                                "part": part.index,
+                                                "attempt": accepted_attempt,
+                                                "episode": episode_index,
+                                                "task_id": accepted_task_id,
+                                                "file": accepted_file,
+                                                "duration_minutes": round(duration_minutes, 2),
+                                                "min_duration_minutes": cfg.split_min_duration_minutes,
+                                                "candidates_collected": collected,
+                                                "candidates_required": required,
+                                                "total_collected": total_collected,
+                                                "total_required": total_required,
+                                            }
+                                        )
+
+                                        if all_ready:
+                                            done_event.set()
+                                    else:
+                                        async with state_lock:
                                             exhausted_by_part[part_index].add(account.id)
                                             remaining = [
                                                 a.id
@@ -892,21 +1087,19 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
 
                                 except Exception as e:
                                     async with state_lock:
-                                        if claimed and in_progress_by_part.get(part_index) == account.id:
-                                            in_progress_by_part[part_index] = None
-                                            exhausted_by_part[part_index].add(account.id)
-                                            remaining = [
-                                                a.id
-                                                for a, _ in account_plans
-                                                if a.id not in exhausted_by_part[part_index]
-                                            ]
-                                            if remaining:
-                                                part_queue.put_nowait(part_index)
-                                            else:
-                                                failure["error"] = (
-                                                    f"part {part_index} failed: {str(e) or type(e).__name__}"
-                                                )
-                                                failed_event.set()
+                                        exhausted_by_part[part_index].add(account.id)
+                                        remaining = [
+                                            a.id
+                                            for a, _ in account_plans
+                                            if a.id not in exhausted_by_part[part_index]
+                                        ]
+                                        if remaining:
+                                            part_queue.put_nowait(part_index)
+                                        else:
+                                            failure["error"] = (
+                                                f"part {part_index} failed: {str(e) or type(e).__name__}"
+                                            )
+                                            failed_event.set()
                                 finally:
                                     part_queue.task_done()
 
@@ -923,14 +1116,11 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                         )
                         async with state_lock:
                             for idx in parts_by_index:
-                                if idx in results_by_part:
-                                    continue
                                 exhausted_by_part[idx].add(account.id)
-                                if in_progress_by_part.get(idx) == account.id:
-                                    in_progress_by_part[idx] = None
-                                    part_queue.put_nowait(idx)
                             for idx in parts_by_index:
-                                if idx in results_by_part:
+                                have = len(candidates_by_part.get(idx, []))
+                                need = max(0, int(required_by_part.get(idx, 1)))
+                                if have >= need:
                                     continue
                                 remaining = [
                                     a.id for a, _ in account_plans if a.id not in exhausted_by_part[idx]
@@ -970,17 +1160,98 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                 await publish({"type": "split_failed", "ts": _now_iso(), "episode": episode_index, "error": err})
                 raise RuntimeError(err)
 
-            parts_paths = [results_by_part[i] for i in sorted(parts_by_index)]
+            def _pick_default(part_idx: int) -> str:
+                cands = candidates_by_part.get(part_idx) or []
+                if not cands:
+                    raise RuntimeError(f"no candidates for part {part_idx}")
+                best = max(cands, key=lambda c: float(c.get("duration_minutes") or 0.0))
+                return str(best.get("file") or "")
+
+            if split_manual_stitch:
+                job.state = "waiting_selection"
+                public_candidates: dict[int, list[dict[str, Any]]] = {}
+                for idx in sorted(parts_by_index):
+                    items = []
+                    for c in candidates_by_part.get(idx, []):
+                        items.append(
+                            {
+                                "file": c.get("file"),
+                                "duration_minutes": c.get("duration_minutes"),
+                                "account_name": c.get("account_name"),
+                                "account_id": c.get("account_id"),
+                            }
+                        )
+                    public_candidates[idx] = items
+                await publish(
+                    {
+                        "type": "split_waiting_selection",
+                        "ts": _now_iso(),
+                        "episode": episode_index,
+                        "segments": len(parts_by_index),
+                        "required_by_part": required_by_part,
+                        "candidates_by_part": public_candidates,
+                    }
+                )
+
+                selection_task = asyncio.create_task(job.wait_for_stitch_selection(episode_index))
+                cancel_task = asyncio.create_task(job._cancel_event.wait())  # type: ignore[attr-defined]
+                try:
+                    done, pending = await asyncio.wait(
+                        {selection_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if cancel_task in done:
+                        selection_task.cancel()
+                        await asyncio.gather(selection_task, return_exceptions=True)
+                        return
+                    selection = selection_task.result()
+                finally:
+                    for t in pending if "pending" in locals() else []:
+                        t.cancel()
+                    await asyncio.gather(cancel_task, return_exceptions=True)
+                job.state = "running"
+                await publish(
+                    {
+                        "type": "split_stitch_selection_received",
+                        "ts": _now_iso(),
+                        "episode": episode_index,
+                        "parts": {str(k): v for k, v in (selection or {}).items()},
+                    }
+                )
+            else:
+                selection = {idx: _pick_default(idx) for idx in enabled_parts}
+
+            expected = set(enabled_parts)
+            if set(selection.keys()) != expected:
+                raise RuntimeError(f"invalid selection; expected parts: {sorted(expected)}")
+
+            parts_paths: list[Path] = []
+            for idx in enabled_parts:
+                filename = str(selection.get(idx) or "")
+                cand = None
+                for c in candidates_by_part.get(idx, []):
+                    if str(c.get("file") or "") == filename:
+                        cand = c
+                        break
+                if not cand or not isinstance(cand.get("path"), Path):
+                    raise RuntimeError(f"invalid selection for part {idx}: {filename}")
+                parts_paths.append(cand["path"])
+
+            enforce_min_duration = len(enabled_parts) == len(parts_by_index)
             stitched_path, stitched_minutes = await stitch_episode(
-                episode_index=episode_index, parts_paths=parts_paths
+                episode_index=episode_index,
+                parts_paths=parts_paths,
+                enforce_min_duration=enforce_min_duration,
             )
 
             if not split_keep_parts:
-                for p in parts_paths:
-                    try:
-                        p.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                for idx in parts_by_index:
+                    for c in candidates_by_part.get(idx, []):
+                        p = c.get("path")
+                        if isinstance(p, Path):
+                            try:
+                                p.unlink(missing_ok=True)
+                            except Exception:
+                                pass
 
             job.downloads += 1
             job.successes += 1
@@ -1085,6 +1356,9 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
 
                     if split_enabled:
                         plan = split_report(report_text, split_segments, include_prefix=True)
+                        candidates_per_part = normalize_split_candidates(
+                            getattr(cfg, "split_candidates_per_part", []), len(plan.parts)
+                        )
                         await publish(
                             {
                                 "type": "split_detected",
@@ -1095,11 +1369,59 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 "detected_items": plan.detected_items,
                                 "segments": len(plan.parts),
                                 "min_part_minutes": cfg.split_min_duration_minutes,
+                                "parallel": False,
+                                "candidates_per_part": candidates_per_part,
+                                "manual_stitch": split_manual_stitch,
                             }
                         )
 
+                        required_by_part: dict[int, int] = {}
+                        for part in plan.parts:
+                            req = (
+                                candidates_per_part[part.index - 1]
+                                if 0 <= (part.index - 1) < len(candidates_per_part)
+                                else 1
+                            )
+                            required_by_part[part.index] = max(0, int(req))
+
+                        enabled_parts = [i for i in sorted(required_by_part) if required_by_part.get(i, 0) > 0]
+                        if not enabled_parts:
+                            await publish(
+                                {
+                                    "type": "split_failed",
+                                    "ts": _now_iso(),
+                                    "account_id": account.id,
+                                    "notebook_id": nb.id,
+                                    "error": "all parts are disabled (candidates_per_part are 0)",
+                                }
+                            )
+                            return
+
+                        # A per-account episode id (JS-safe int) for manual stitch selection.
+                        episode_index = int(datetime.now(timezone.utc).timestamp() * 1000)
+                        episode_index = episode_index * 1000 + (abs(hash(account.id)) % 1000)
+                        total_required = sum(max(0, int(required_by_part.get(i, 0))) for i in enabled_parts)
+
                         sources = []
                         for part in plan.parts:
+                            part_required = int(required_by_part.get(part.index, 1) or 0)
+                            if part_required <= 0:
+                                await publish(
+                                    {
+                                        "type": "split_part_skipped",
+                                        "ts": _now_iso(),
+                                        "account_id": account.id,
+                                        "notebook_id": nb.id,
+                                        "part": part.index,
+                                        "episode": episode_index,
+                                        "item_start": part.item_start,
+                                        "item_end": part.item_end,
+                                        "item_count": part.item_count,
+                                        "reason": "candidates_per_part=0",
+                                    }
+                                )
+                                continue
+
                             header = (
                                 f"【分段 {part.index}/{part.total}】"
                                 + (
@@ -1125,6 +1447,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     "account_id": account.id,
                                     "notebook_id": nb.id,
                                     "part": part.index,
+                                    "episode": episode_index,
                                     "source_id": src.id,
                                     "source_method": source_method,
                                     "item_start": part.item_start,
@@ -1133,7 +1456,9 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 }
                             )
 
-                        parts_paths: list[Path] = []
+                        candidates_by_part: dict[int, list[dict[str, Any]]] = {
+                            idx: [] for idx in sorted(required_by_part)
+                        }
                         for part, src in sources:
                             if job.is_cancelled:
                                 return
@@ -1141,7 +1466,10 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 if job.successes >= target:
                                     return
 
-                            accepted_path: Path | None = None
+                            part_required = int(required_by_part.get(part.index, 1) or 0)
+                            if part_required <= 0:
+                                continue
+
                             generate_lock = asyncio.Lock()
                             task_id_by_attempt: dict[int, str] = {}
                             attempt_by_task: dict[asyncio.Task, int] = {}
@@ -1281,6 +1609,40 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                             f"{math.floor(duration_minutes):02d}min_{task_id}.mp4"
                                         )
                                         final_path = job.outputs_dir / final_name
+                                        silence_name = (
+                                            f"{_sanitize_filename(account.name)}_p{part.index:02d}_"
+                                            f"a{attempt:02d}_silence_{task_id}.mp4"
+                                            if cfg.keep_short_files
+                                            else None
+                                        )
+                                        silence_ok = await check_silence(
+                                            path=tmp_path,
+                                            account_id=account.id,
+                                            account_name=account.name,
+                                            notebook_id=nb.id,
+                                            task_id=task_id,
+                                            attempt=attempt,
+                                            part=part.index,
+                                            episode=episode_index,
+                                            file_name_ok=final_name,
+                                            file_name_reject=silence_name,
+                                        )
+                                        if not silence_ok:
+                                            if cfg.keep_short_files and silence_name:
+                                                silence_path = job.outputs_dir / silence_name
+                                                tmp_path.replace(silence_path)
+                                                tmp_path = None
+                                            else:
+                                                try:
+                                                    tmp_path.unlink(missing_ok=True)
+                                                except Exception:
+                                                    pass
+                                            if cfg.delete_short_artifacts:
+                                                try:
+                                                    await client.artifacts.delete(nb.id, task_id)
+                                                except Exception:
+                                                    pass
+                                            return None
                                         tmp_path.replace(final_path)
                                         tmp_path = None
                                         return {
@@ -1390,7 +1752,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     while (
                                         next_attempt <= max_attempts
                                         and len(active) < per_account_concurrency
-                                        and accepted_path is None
+                                        and len(candidates_by_part.get(part.index, [])) < part_required
                                     ):
                                         attempt_no = next_attempt
                                         next_attempt += 1
@@ -1398,7 +1760,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                         attempt_by_task[t] = attempt_no
                                         active.add(t)
 
-                                    if not active or accepted_path is not None:
+                                    if not active:
                                         break
 
                                     done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
@@ -1414,43 +1776,72 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                         if not outcome or not outcome.get("ok"):
                                             continue
 
-                                        accepted_path = outcome.get("path")
                                         duration_minutes = float(outcome["duration_minutes"])
+                                        accepted_path = outcome.get("path")
+                                        accepted_task_id = str(outcome.get("task_id") or "")
+                                        accepted_file = str(outcome.get("file") or "")
+                                        accepted_attempt = int(outcome.get("attempt") or 0)
+                                        if isinstance(accepted_path, Path):
+                                            candidates_by_part[part.index].append(
+                                                {
+                                                    "path": accepted_path,
+                                                    "file": accepted_file,
+                                                    "task_id": accepted_task_id,
+                                                    "duration_minutes": duration_minutes,
+                                                    "account_id": account.id,
+                                                    "account_name": account.name,
+                                                    "attempt": accepted_attempt,
+                                                }
+                                            )
+                                        collected = len(candidates_by_part.get(part.index, []))
+                                        total_collected = sum(
+                                            len(candidates_by_part.get(i, [])) for i in enabled_parts
+                                        )
                                         await publish(
                                             {
                                                 "type": "part_accepted",
                                                 "ts": _now_iso(),
                                                 "account_id": account.id,
+                                                "account_name": account.name,
                                                 "notebook_id": nb.id,
                                                 "part": part.index,
-                                                "attempt": int(outcome["attempt"]),
-                                                "task_id": str(outcome["task_id"]),
-                                                "file": str(outcome["file"]),
+                                                "attempt": accepted_attempt,
+                                                "episode": episode_index,
+                                                "task_id": accepted_task_id,
+                                                "file": accepted_file,
                                                 "duration_minutes": round(duration_minutes, 2),
                                                 "min_duration_minutes": cfg.split_min_duration_minutes,
+                                                "candidates_collected": collected,
+                                                "candidates_required": part_required,
+                                                "total_collected": total_collected,
+                                                "total_required": total_required,
                                             }
                                         )
 
-                                        accepted_task_id = str(outcome.get("task_id") or "")
-                                        extra_task_ids = []
-                                        if delete_cancelled_artifacts:
-                                            for p in active:
-                                                a_no = attempt_by_task.get(p)
-                                                tid = task_id_by_attempt.get(int(a_no)) if a_no is not None else None
-                                                if tid and tid != accepted_task_id:
-                                                    extra_task_ids.append(tid)
+                                        if collected >= part_required:
+                                            extra_task_ids = []
+                                            if delete_cancelled_artifacts:
+                                                for p in active:
+                                                    a_no = attempt_by_task.get(p)
+                                                    tid = (
+                                                        task_id_by_attempt.get(int(a_no))
+                                                        if a_no is not None
+                                                        else None
+                                                    )
+                                                    if tid and tid != accepted_task_id:
+                                                        extra_task_ids.append(tid)
 
-                                        for p in active:
-                                            p.cancel()
-                                        await asyncio.gather(*active, return_exceptions=True)
-                                        active.clear()
-                                        if delete_cancelled_artifacts and extra_task_ids:
-                                            deletes = [
-                                                asyncio.create_task(client.artifacts.delete(nb.id, tid))
-                                                for tid in set(extra_task_ids)
-                                            ]
-                                            await asyncio.gather(*deletes, return_exceptions=True)
-                                        break
+                                            for p in active:
+                                                p.cancel()
+                                            await asyncio.gather(*active, return_exceptions=True)
+                                            active.clear()
+                                            if delete_cancelled_artifacts and extra_task_ids:
+                                                deletes = [
+                                                    asyncio.create_task(client.artifacts.delete(nb.id, tid))
+                                                    for tid in set(extra_task_ids)
+                                                ]
+                                                await asyncio.gather(*deletes, return_exceptions=True)
+                                            break
                             finally:
                                 extra_task_ids = []
                                 if delete_cancelled_artifacts:
@@ -1469,19 +1860,103 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     ]
                                     await asyncio.gather(*deletes, return_exceptions=True)
 
-                            if accepted_path is None:
+                            if len(candidates_by_part.get(part.index, [])) < part_required:
                                 await publish(
                                     {
                                         "type": "split_failed",
                                         "ts": _now_iso(),
                                         "account_id": account.id,
                                         "notebook_id": nb.id,
-                                        "error": f"part {part.index} failed to reach duration threshold",
+                                        "episode": episode_index,
+                                        "error": (
+                                            f"part {part.index} failed to reach duration threshold "
+                                            f"({len(candidates_by_part.get(part.index, []))}/{part_required})"
+                                        ),
                                     }
                                 )
                                 return
 
-                            parts_paths.append(accepted_path)
+                        def _pick_default(part_idx: int) -> str:
+                            cands = candidates_by_part.get(part_idx, [])
+                            if not cands:
+                                return ""
+                            best = max(cands, key=lambda c: float(c.get("duration_minutes") or 0.0))
+                            return str(best.get("file") or "")
+
+                        selection: dict[int, str] = {}
+                        if split_manual_stitch:
+                            job.state = "waiting_selection"
+                            public_candidates: dict[int, list[dict[str, Any]]] = {}
+                            for idx in sorted(required_by_part):
+                                items = []
+                                for c in candidates_by_part.get(idx, []):
+                                    items.append(
+                                        {
+                                            "file": c.get("file"),
+                                            "duration_minutes": c.get("duration_minutes"),
+                                            "account_name": c.get("account_name"),
+                                            "account_id": c.get("account_id"),
+                                        }
+                                    )
+                                public_candidates[idx] = items
+
+                            await publish(
+                                {
+                                    "type": "split_waiting_selection",
+                                    "ts": _now_iso(),
+                                    "episode": episode_index,
+                                    "segments": len(plan.parts),
+                                    "required_by_part": required_by_part,
+                                    "candidates_by_part": public_candidates,
+                                }
+                            )
+
+                            selection_task = asyncio.create_task(
+                                job.wait_for_stitch_selection(episode_index)
+                            )
+                            cancel_task = asyncio.create_task(job._cancel_event.wait())  # type: ignore[attr-defined]
+                            try:
+                                done, pending = await asyncio.wait(
+                                    {selection_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+                                )
+                                if cancel_task in done:
+                                    selection_task.cancel()
+                                    await asyncio.gather(selection_task, return_exceptions=True)
+                                    return
+                                selection = selection_task.result()
+                            finally:
+                                for t in pending if "pending" in locals() else []:
+                                    t.cancel()
+                                await asyncio.gather(cancel_task, return_exceptions=True)
+                            job.state = "running"
+                            await publish(
+                                {
+                                    "type": "split_stitch_selection_received",
+                                    "ts": _now_iso(),
+                                    "account_id": account.id,
+                                    "notebook_id": nb.id,
+                                    "episode": episode_index,
+                                    "parts": {str(k): v for k, v in (selection or {}).items()},
+                                }
+                            )
+                        else:
+                            selection = {idx: _pick_default(idx) for idx in enabled_parts}
+
+                        expected = set(enabled_parts)
+                        if set(selection.keys()) != expected:
+                            raise RuntimeError(f"invalid selection; expected parts: {sorted(expected)}")
+
+                        parts_paths: list[Path] = []
+                        for idx in enabled_parts:
+                            filename = str(selection.get(idx) or "")
+                            cand = None
+                            for c in candidates_by_part.get(idx, []):
+                                if str(c.get("file") or "") == filename:
+                                    cand = c
+                                    break
+                            if not cand or not isinstance(cand.get("path"), Path):
+                                raise RuntimeError(f"invalid selection for part {idx}: {filename}")
+                            parts_paths.append(cand["path"])
 
                         output_format = (
                             split_output_format
@@ -1521,13 +1996,15 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                             }
                         )
 
-                        if merged_duration.seconds < min_seconds:
+                        enforce_min_duration = len(enabled_parts) == len(plan.parts)
+                        if enforce_min_duration and merged_duration.seconds < min_seconds:
                             await publish(
                                 {
                                     "type": "stitch_rejected",
                                     "ts": _now_iso(),
                                     "account_id": account.id,
                                     "notebook_id": nb.id,
+                                    "episode": episode_index,
                                     "file": result.output_path.name,
                                     "duration_minutes": round(merged_minutes, 2),
                                     "min_duration_minutes": cfg.min_duration_minutes,
@@ -1547,11 +2024,14 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                         result.output_path.replace(final_path)
 
                         if not split_keep_parts:
-                            for p in parts_paths:
-                                try:
-                                    p.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                            for idx in candidates_by_part:
+                                for c in candidates_by_part.get(idx, []):
+                                    p = c.get("path")
+                                    if isinstance(p, Path):
+                                        try:
+                                            p.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
 
                         async with success_lock:
                             job.downloads += 1
@@ -1696,16 +2176,48 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                             duration = get_audio_duration(tmp_path)
                             duration_minutes = duration.minutes
                             accepted = duration.seconds >= min_seconds
-                            keep_file = accepted or cfg.keep_short_files or target_mode == "downloaded"
+                            silence_rejected = False
+                            final_name: str | None = None
+                            silence_name: str | None = None
+                            if accepted:
+                                mm = max(0, math.floor(duration_minutes))
+                                final_name = (
+                                    f"{_sanitize_filename(account.name)}_{attempt:02d}_{mm:02d}min_{task_id}.mp4"
+                                )
+                                if cfg.keep_short_files:
+                                    silence_name = (
+                                        f"{_sanitize_filename(account.name)}_{attempt:02d}_{mm:02d}min_silence_{task_id}.mp4"
+                                    )
+                                silence_ok = await check_silence(
+                                    path=tmp_path,
+                                    account_id=account.id,
+                                    account_name=account.name,
+                                    notebook_id=nb.id,
+                                    task_id=task_id,
+                                    attempt=attempt,
+                                    part=None,
+                                    episode=None,
+                                    file_name_ok=final_name,
+                                    file_name_reject=silence_name,
+                                )
+                                if not silence_ok:
+                                    accepted = False
+                                    silence_rejected = True
+
+                            keep_file = (
+                                accepted
+                                or cfg.keep_short_files
+                                or (target_mode == "downloaded" and not silence_rejected)
+                            )
 
                             file_name = tmp_name
                             if keep_file:
-                                mm = max(0, math.floor(duration_minutes))
                                 if accepted:
-                                    file_name = (
-                                        f"{_sanitize_filename(account.name)}_{attempt:02d}_{mm:02d}min_{task_id}.mp4"
-                                    )
+                                    file_name = final_name or tmp_name
+                                elif silence_rejected:
+                                    file_name = silence_name or tmp_name
                                 else:
+                                    mm = max(0, math.floor(duration_minutes))
                                     file_name = (
                                         f"{_sanitize_filename(account.name)}_{attempt:02d}_{mm:02d}min_short_{task_id}.mp4"
                                     )
@@ -1749,6 +2261,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     "duration_seconds": duration.seconds,
                                     "duration_minutes": round(duration_minutes, 2),
                                     "duration_method": duration.method,
+                                    "silence_rejected": silence_rejected,
                                 }
                             )
 

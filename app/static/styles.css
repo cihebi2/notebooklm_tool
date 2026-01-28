@@ -646,6 +646,29 @@ a.btn{text-decoration:none}
   justify-content:space-between;
   gap:12px;
 }
+.splitPromptControls{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+.splitCandidateCtl{
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+.splitCandidateCtl .hint{
+  margin:0;
+}
+.splitCandidateInput{
+  width:74px;
+  padding:6px 8px;
+  border-radius:12px;
+  border:1px solid var(--stroke);
+  background: rgba(0,0,0,.20);
+  color: rgba(244,242,255,.92);
+  font-family:"Recursive", ui-monospace, monospace;
+  font-size:12px;
+}
 .splitPromptTitle{
   font-weight:800;
   font-size:12px;
@@ -656,6 +679,43 @@ a.btn{text-decoration:none}
 }
 .splitPromptPreview{
   min-height:140px;
+}
+
+.stitchPanel{
+  border:1px solid var(--stroke);
+  border-radius:18px;
+  background: rgba(0,0,0,.16);
+  padding:12px;
+}
+.stitchPanel .stitchTitle{
+  font-weight:800;
+  font-size:12px;
+  letter-spacing:.2px;
+  margin-bottom:8px;
+}
+.stitchPanel .stitchGrid{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap:10px;
+  margin-top:10px;
+}
+.stitchPanel .stitchCell{
+  border:1px solid rgba(255,255,255,.06);
+  background: rgba(0,0,0,.10);
+  border-radius:14px;
+  padding:10px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.stitchPanel select{
+  width:100%;
+}
+.stitchPanel .stitchActions{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:10px;
 }
 
 .jobs{

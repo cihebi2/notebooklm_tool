@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,11 +28,13 @@ class JobConfig(BaseModel):
 
     min_duration_minutes: float = Field(ge=1, le=240, default=40.0)
     split_enabled: bool = False
-    split_parallel: bool = False
+    split_parallel: bool = True
     split_segments: int = Field(ge=2, le=10, default=3)
     split_min_duration_minutes: float = Field(ge=1, le=120, default=15.0)
     split_output_format: str = Field(default="m4a")  # mp3 | mp4 | m4a
-    split_keep_parts: bool = False
+    split_keep_parts: bool = True
+    split_manual_stitch: bool = False
+    split_candidates_per_part: list[int] = Field(default_factory=list)
     split_part_instructions: list[str] = Field(default_factory=list)
 
     language: str = Field(default="zh")
@@ -40,12 +42,15 @@ class JobConfig(BaseModel):
     audio_format: str = Field(default="deep_dive")  # deep_dive|brief|critique|debate
     instructions: str = Field(default="")
 
-    per_account_concurrency: int = Field(ge=1, le=6, default=1)
-    accounts_concurrency: int = Field(ge=1, le=20, default=2)
+    per_account_concurrency: int = Field(ge=1, le=6, default=2)
+    accounts_concurrency: int = Field(ge=1, le=20, default=4)
 
     keep_short_files: bool = False
     delete_short_artifacts: bool = True
     delete_cancelled_artifacts: bool = True
+    silence_check_enabled: bool = True
+    silence_min_duration_s: float = Field(ge=1, le=120, default=5.0)
+    silence_threshold_db: float = Field(ge=-80, le=-10, default=-50.0)
 
     @field_validator("target_mode")
     @classmethod
@@ -67,6 +72,22 @@ class JobConfig(BaseModel):
         cleaned: list[str] = []
         for item in value[:10]:
             cleaned.append(str(item or ""))
+        return cleaned
+
+    @field_validator("split_candidates_per_part")
+    @classmethod
+    def _validate_split_candidates_per_part(cls, value: list[int] | None) -> list[int]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("split_candidates_per_part must be a list")
+        cleaned: list[int] = []
+        for item in value[:10]:
+            try:
+                n = int(item)  # may be str
+            except Exception:
+                n = 1
+            cleaned.append(max(0, min(n, 20)))
         return cleaned
 
 
@@ -92,6 +113,9 @@ class Job:
     event_log: list[dict[str, Any]]
     successes: int
     downloads: int
+    _stitch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _stitch_futures: dict[int, asyncio.Future[dict[int, str]]] = field(default_factory=dict, repr=False)
+    _stitch_pending: dict[int, dict[int, str]] = field(default_factory=dict, repr=False)
 
     @property
     def job_dir(self) -> Path:
@@ -177,6 +201,17 @@ class Job:
             if isinstance(ev.get("account_id"), str) and "account_id" not in m:
                 m["account_id"] = ev["account_id"]
 
+            if ev.get("part") is not None and "part" not in m:
+                try:
+                    m["part"] = int(ev["part"])
+                except Exception:
+                    pass
+            if ev.get("episode") is not None and "episode" not in m:
+                try:
+                    m["episode"] = int(ev["episode"])
+                except Exception:
+                    pass
+
             if ev.get("duration_minutes") is not None:
                 try:
                     m["duration_minutes"] = float(ev["duration_minutes"])
@@ -185,6 +220,22 @@ class Job:
             duration_method = ev.get("duration_method") or ev.get("method")
             if isinstance(duration_method, str) and duration_method:
                 m["duration_method"] = duration_method
+
+            ev_type = str(ev.get("type") or "")
+            if ev_type in {"silence_ok", "part_silence_ok"}:
+                m["silence"] = "ok"
+                if ev.get("min_silence_duration_s") is not None:
+                    m["silence_min_duration_s"] = ev.get("min_silence_duration_s")
+                if ev.get("threshold_db") is not None:
+                    m["silence_threshold_db"] = ev.get("threshold_db")
+            if ev_type in {"silence_rejected", "part_silence_rejected"}:
+                m["silence"] = "fail"
+                if ev.get("min_silence_duration_s") is not None:
+                    m["silence_min_duration_s"] = ev.get("min_silence_duration_s")
+                if ev.get("threshold_db") is not None:
+                    m["silence_threshold_db"] = ev.get("threshold_db")
+                if ev.get("segments_count") is not None:
+                    m["silence_segments_count"] = ev.get("segments_count")
 
             result = type_to_result.get(str(ev.get("type") or ""))
             if result:
@@ -199,6 +250,27 @@ class Job:
                 info.update(meta_by_name.get(p.name, {}))
                 files.append(info)
         return files
+
+    async def wait_for_stitch_selection(self, episode: int) -> dict[int, str]:
+        ep = max(1, int(episode))
+        async with self._stitch_lock:
+            pending = self._stitch_pending.pop(ep, None)
+            if pending is not None:
+                return pending
+            fut = self._stitch_futures.get(ep)
+            if fut is None or fut.done():
+                fut = asyncio.get_running_loop().create_future()
+                self._stitch_futures[ep] = fut
+        return await fut
+
+    async def submit_stitch_selection(self, episode: int, selection: dict[int, str]) -> None:
+        ep = max(1, int(episode))
+        async with self._stitch_lock:
+            fut = self._stitch_futures.get(ep)
+            if fut is not None and not fut.done():
+                fut.set_result(selection)
+                return
+            self._stitch_pending[ep] = selection
 
     async def _persist_event(self, event: dict[str, Any]) -> None:
         # Best-effort local persistence: append JSONL event log + rewrite snapshot.
@@ -308,7 +380,7 @@ class JobManager:
                                 job.event_log.append(ev)
 
                     # We can't resume running jobs across restarts; mark them as failed.
-                    if job.state in {"queued", "running"}:
+                    if job.state in {"queued", "running", "waiting_selection"}:
                         job.state = "failed"
                         job.error = job.error or "Server restarted while job was running; cannot resume."
 

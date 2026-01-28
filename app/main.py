@@ -312,6 +312,98 @@ async def cancel_job(job_id: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+class StitchRequest(BaseModel):
+    episode: int = 1
+    parts: dict[str, str] = Field(default_factory=dict)
+
+
+@app.post("/api/jobs/{job_id}/stitch")
+async def stitch_job(job_id: str, req: StitchRequest) -> dict[str, Any]:
+    job = job_manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    if not bool(getattr(job.config, "split_enabled", False)):
+        raise HTTPException(status_code=400, detail="job is not split_enabled")
+
+    episode = max(1, int(req.episode or 1))
+    raw = req.parts if isinstance(req.parts, dict) else {}
+    if not raw:
+        raise HTTPException(status_code=400, detail="parts is empty")
+
+    selection: dict[int, str] = {}
+    for k, v in raw.items():
+        try:
+            part_idx = int(k)
+        except Exception:
+            continue
+        name = str(v or "").strip()
+        if part_idx <= 0 or not name:
+            continue
+        selection[part_idx] = name
+
+    segments = int(getattr(job.config, "split_segments", 3) or 3)
+    raw_candidates = getattr(job.config, "split_candidates_per_part", []) or []
+    candidates_per_part: list[int] = []
+    for i in range(max(1, segments)):
+        try:
+            n = int(raw_candidates[i]) if i < len(raw_candidates) else 1
+        except Exception:
+            n = 1
+        if n < 0:
+            n = 1
+        candidates_per_part.append(min(n, 20))
+    enabled_parts = {i + 1 for i, n in enumerate(candidates_per_part) if int(n or 0) > 0}
+    if not enabled_parts:
+        raise HTTPException(status_code=400, detail="all parts are disabled (candidates_per_part are 0)")
+    if set(selection.keys()) != enabled_parts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"must select exactly these parts: {sorted(enabled_parts)}",
+        )
+
+    base = job.outputs_dir.resolve()
+    for part_idx, filename in selection.items():
+        path = (base / filename).resolve()
+        if not path.is_relative_to(base):
+            raise HTTPException(status_code=400, detail=f"invalid filename: {filename}")
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"file not found: {filename}")
+
+        ok = False
+        for ev in reversed(job.event_log[-20000:]):
+            if not isinstance(ev, dict):
+                continue
+            if str(ev.get("type") or "") != "part_accepted":
+                continue
+            if str(ev.get("file") or "") != filename:
+                continue
+            try:
+                ev_part = int(ev.get("part") or 0)
+            except Exception:
+                ev_part = 0
+            try:
+                ev_ep = int(ev.get("episode") or 1)
+            except Exception:
+                ev_ep = 1
+            if ev_part == part_idx and ev_ep == episode:
+                ok = True
+                break
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"file not a valid candidate: {filename}")
+
+    await job.publish(
+        {
+            "type": "split_stitch_selection_submitted",
+            "ts": _now_iso(),
+            "job_id": job.id,
+            "episode": episode,
+            "parts": selection,
+        }
+    )
+    await job.submit_stitch_selection(episode, selection)
+    return {"ok": True}
+
+
 @app.get("/api/jobs/{job_id}/events")
 async def job_events(job_id: str) -> StreamingResponse:
     job = job_manager.get(job_id)

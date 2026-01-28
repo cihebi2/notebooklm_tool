@@ -123,6 +123,7 @@
 
             <div id="tab-files" class="field tabPane" style="margin-top:12px">
               <label>下载文件</label>
+              <div id="stitchPanel" class="stitchPanel" style="display:none; margin-top:8px"></div>
               <div id="files" class="files">
                 <div class="hint">还没有下载文件。达标后会出现在这里。</div>
               </div>
@@ -275,7 +276,7 @@
                     margin-top: 6px;
                   "
                 >
-                  <input id="splitParallel" type="checkbox" />
+                  <input id="splitParallel" type="checkbox" checked />
                   Generate segments in parallel using multiple accounts (faster, but higher rate-limit risk)
                 </label>
               </div>
@@ -302,8 +303,24 @@
                     margin-top: 6px;
                   "
                 >
-                  <input id="splitKeepParts" type="checkbox" />
+                  <input id="splitKeepParts" type="checkbox" checked />
                   保留分段文件（调试用）
+                </label>
+              </div>
+              <div class="field">
+                <label>手动拼接</label>
+                <label
+                  style="
+                    display: flex;
+                    gap: 8px;
+                    align-items: center;
+                    font-size: 12px;
+                    color: var(--muted);
+                    margin-top: 6px;
+                  "
+                >
+                  <input id="splitManualStitch" type="checkbox" checked />
+                  先生成候选音频，手动选择每段后再拼接（推荐）
                 </label>
               </div>
               <div class="field">
@@ -344,12 +361,12 @@
             <div class="row" style="margin-top:10px">
               <div class="field">
                 <label>账号并发</label>
-                <input id="accConcurrency" type="number" min="1" max="20" value="2" />
-                <div class="hint">并发越高越容易触发限流；建议 1–2。</div>
+                <input id="accConcurrency" type="number" min="1" max="20" value="4" />
+                <div class="hint">并发越高越容易触发限流；建议 1–4。</div>
               </div>
               <div class="field">
                 <label>单账号并行生成数</label>
-                <input id="perAccConcurrency" type="number" min="1" max="6" value="1" />
+                <input id="perAccConcurrency" type="number" min="1" max="6" value="2" />
                 <div class="hint">单账号同时生成多少条音频（更快，但更容易限流）</div>
               </div>
               <div class="field">
@@ -364,6 +381,25 @@
                     删除短 artifact
                   </label>
                 </div>
+              </div>
+            </div>
+
+            <div class="row" style="margin-top:10px">
+              <div class="field">
+                <label>静音检测</label>
+                <label style="display:flex; gap:8px; align-items:center; font-size:12px; color:var(--muted); margin-top:6px">
+                  <input id="silenceCheckEnabled" type="checkbox" checked />
+                  启用静音检测（超过 5s 视为作废）
+                </label>
+              </div>
+              <div class="field">
+                <label>静音阈值 (dB)</label>
+                <input id="silenceThreshold" type="number" min="-80" max="-10" step="1" value="-50" />
+                <div class="hint">阈值越高越敏感（-45/-40 更容易判静音）</div>
+              </div>
+              <div class="field">
+                <label>静音时长 (秒)</label>
+                <input id="silenceMinSeconds" type="number" min="1" max="120" step="0.5" value="5" />
               </div>
             </div>
 
