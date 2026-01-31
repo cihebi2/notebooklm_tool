@@ -40,6 +40,7 @@ class JobConfig(BaseModel):
     stitch_transition_fade_seconds: float = Field(ge=0, le=10, default=3.0)
     stitch_transition_files: list[str] = Field(default_factory=list)
     stitch_transition_repeats: list[int] = Field(default_factory=list)
+    stitch_transition_durations: list[float] = Field(default_factory=list)
 
     language: str = Field(default="zh")
     audio_length: str = Field(default="long")  # short|default|long
@@ -107,6 +108,26 @@ class JobConfig(BaseModel):
                 n = 0
             if n > 5:
                 n = 5
+            cleaned.append(n)
+        return cleaned
+
+    @field_validator("stitch_transition_durations")
+    @classmethod
+    def _validate_stitch_transition_durations(cls, value: list[float] | None) -> list[float]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("stitch_transition_durations must be a list")
+        cleaned: list[float] = []
+        for item in value[:20]:
+            try:
+                n = float(item)
+            except Exception:
+                n = 0.0
+            if n < 0:
+                n = 0.0
+            if n > 600:
+                n = 600.0
             cleaned.append(n)
         return cleaned
 

@@ -371,6 +371,14 @@ class StitchRequest(BaseModel):
     parts: dict[str, str] = Field(default_factory=dict)
 
 
+class ConcatImportRequest(BaseModel):
+    job_id: str
+    file: str
+    repeat: int | None = None
+    quality: int | None = None
+    output_name: str | None = None
+
+
 @app.post("/api/jobs/{job_id}/stitch")
 async def stitch_job(job_id: str, req: StitchRequest) -> dict[str, Any]:
     job = job_manager.get(job_id)
@@ -700,4 +708,42 @@ async def concat_info() -> dict[str, Any]:
         "ffmpeg": concat_service.ffmpeg,
         "ffprobe": concat_service.ffprobe,
         "jobs": len(concat_service.jobs),
+    }
+
+
+@app.post("/concat/api/import")
+async def concat_import(req: ConcatImportRequest) -> dict[str, Any]:
+    job = job_manager.get(req.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    name = Path(req.file or "").name
+    if not name:
+        raise HTTPException(status_code=400, detail="file is empty")
+    src = (job.outputs_dir / name).resolve()
+    if not src.exists() or not src.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+
+    repeat = int(req.repeat or 3)
+    if repeat < 1 or repeat > 20:
+        repeat = 3
+    quality = int(req.quality or 5)
+    if quality < 0 or quality > 9:
+        quality = 5
+
+    loop = asyncio.get_running_loop()
+    concat_job = concat_service.create_job(
+        upload_paths=[src],
+        repeat=repeat,
+        quality=quality,
+        output_name=req.output_name or src.stem,
+        loop=loop,
+    )
+
+    return {
+        "ok": True,
+        "jobId": concat_job.id,
+        "outputFile": concat_job.output_file,
+        "outputPath": str(concat_job.output_path),
+        "eventsUrl": f"/concat/api/jobs/{concat_job.id}/events",
+        "downloadUrl": f"/concat/download/{concat_job.output_file}",
     }

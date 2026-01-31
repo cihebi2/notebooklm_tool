@@ -29,6 +29,7 @@ const STORAGE_SPLIT_PARTS = "notebooklm.splitPartPrompts";
 const STORAGE_SPLIT_CANDIDATES = "notebooklm.splitCandidatesPerPart";
 const STORAGE_STITCH_TRANSITIONS = "notebooklm.stitchTransitions";
 const STORAGE_STITCH_TRANSITION_REPEATS = "notebooklm.stitchTransitionRepeats";
+const STORAGE_STITCH_TRANSITION_DURATIONS = "notebooklm.stitchTransitionDurations";
 const STORAGE_STITCH_TRANSITION_LOCK = "notebooklm.stitchTransitionLock";
 const STORAGE_LAST_RUN_CONFIG = "notebooklm.lastRunConfig";
 const STALL_WARNING_MS = 20 * 60 * 1000;
@@ -37,6 +38,9 @@ const DEFAULT_TRANSITIONS_BY_SEGMENTS = {
     "assets/transitions/第一二段之间的链接-轻快活泼自由自在尤克里里.wav",
     "assets/transitions/第二三段之间的连接-欢快轻快节奏活力阳光.wav",
   ],
+};
+const DEFAULT_TRANSITION_DURATIONS_BY_SEGMENTS = {
+  3: [30, 25],
 };
 
 function persistLastJobId(jobId){
@@ -118,6 +122,7 @@ function collectLastRunConfig(){
     stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "3"),
     stitch_transition_files: _normalizeTransitions(_readTransitions(), segs),
     stitch_transition_repeats: _normalizeTransitionRepeats(_readTransitionRepeats(), segs),
+    stitch_transition_durations: _normalizeTransitionDurations(_readTransitionDurations(), segs),
     stitch_transition_lock: !!$("#stitchTransitionLock")?.checked,
     language: $("#lang")?.value || "zh",
     audio_length: $("#audioLength")?.value || "long",
@@ -162,6 +167,9 @@ function restoreLastRunConfig(){
     }
     if (Array.isArray(cfg.stitch_transition_repeats)){
       _writeTransitionRepeats(_normalizeTransitionRepeats(cfg.stitch_transition_repeats, segs));
+    }
+    if (Array.isArray(cfg.stitch_transition_durations)){
+      _writeTransitionDurations(_normalizeTransitionDurations(cfg.stitch_transition_durations, segs));
     }
     if (cfg.stitch_transition_lock != null){
       _writeTransitionLock(!!cfg.stitch_transition_lock);
@@ -922,7 +930,7 @@ function renderFiles(job){
     if (Number.isFinite(dm)){
       parts.push(`${dm.toFixed(2).replace(/\\.00$/,"")} min`);
     } else {
-      const m = /_([0-9]+(?:\.[0-9]+)?)min_/i.exec(String(f.name || ""));
+      const m = /[-_ ]([0-9]+(?:\.[0-9]+)?)min[_-]?/i.exec(String(f.name || ""));
       if (m) parts.push(`~${m[1]} min`);
     }
     if (f.account_name) parts.push(`@${f.account_name}`);
@@ -951,7 +959,33 @@ function renderFiles(job){
     row.append(top, right);
 
     const ext = String(f.name || "").split(".").pop().toLowerCase();
-    if (["mp3","mp4","m4a"].includes(ext)){
+    const isAudio = ["mp3","mp4","m4a"].includes(ext);
+    if (isAudio){
+      const importBtn = document.createElement("button");
+      importBtn.type = "button";
+      importBtn.className = "btn";
+      importBtn.textContent = "一键导入拼接";
+      importBtn.addEventListener("click", async () => {
+        const win = window.open("/concat", "_blank");
+        try{
+          const res = await fetch("/concat/api/import", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ job_id: job.id, file: f.name }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.ok){
+            throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+          }
+          alert(`已导入拼接：${data.outputFile || f.name}`);
+        }catch(e){
+          if (win && win.close) try{ win.close(); }catch(_){}
+          alert(`导入拼接失败：${String(e)}`);
+        }
+      });
+      right.append(importBtn);
+    }
+    if (isAudio){
       const preview = document.createElement("div");
       preview.className = "preview";
 
@@ -1530,6 +1564,16 @@ function _writeTransitionRepeats(list){
   }catch{}
 }
 
+function _readTransitionDurations(){
+  return _readJSON(STORAGE_STITCH_TRANSITION_DURATIONS, []);
+}
+
+function _writeTransitionDurations(list){
+  try{
+    localStorage.setItem(STORAGE_STITCH_TRANSITION_DURATIONS, JSON.stringify(list || []));
+  }catch{}
+}
+
 function _readTransitionLock(){
   return _readJSON(STORAGE_STITCH_TRANSITION_LOCK, null);
 }
@@ -1556,6 +1600,14 @@ function _hasStoredTransitionRepeats(){
   }
 }
 
+function _hasStoredTransitionDurations(){
+  try{
+    return localStorage.getItem(STORAGE_STITCH_TRANSITION_DURATIONS) !== null;
+  }catch{
+    return false;
+  }
+}
+
 function _hasStoredTransitionLock(){
   try{
     return localStorage.getItem(STORAGE_STITCH_TRANSITION_LOCK) !== null;
@@ -1572,6 +1624,16 @@ function _defaultTransitions(segments){
 function _defaultTransitionRepeats(segments){
   const gaps = Math.max(0, (Number(segments) || 0) - 1);
   return Array.from({length: gaps}, () => 1);
+}
+
+function _defaultTransitionDurations(segments){
+  const key = Number(segments) || 0;
+  const preset = DEFAULT_TRANSITION_DURATIONS_BY_SEGMENTS[key];
+  if (Array.isArray(preset) && preset.length){
+    return preset.slice();
+  }
+  const gaps = Math.max(0, key - 1);
+  return Array.from({length: gaps}, () => 30);
 }
 
 function _getSplitSegments(){
@@ -1612,6 +1674,19 @@ function _normalizeTransitionRepeats(list, segments){
     if (!Number.isFinite(n)) return 1;
     if (n < 0) return 0;
     if (n > 5) return 5;
+    return n;
+  });
+}
+
+function _normalizeTransitionDurations(list, segments){
+  const gaps = Math.max(0, (Number(segments) || 0) - 1);
+  const out = Array.isArray(list) ? list.slice(0, gaps) : [];
+  while (out.length < gaps) out.push(30);
+  return out.map(v => {
+    const n = parseFloat(v ?? "0");
+    if (!Number.isFinite(n)) return 0;
+    if (n < 0) return 0;
+    if (n > 600) return 600;
     return n;
   });
 }
@@ -1721,6 +1796,7 @@ function renderTransitionList(){
   const gaps = Math.max(0, segments - 1);
   let list = _normalizeTransitions(_readTransitions(), segments);
   let repeats = _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
+  let durations = _normalizeTransitionDurations(_readTransitionDurations(), segments);
   let lock = _readTransitionLock();
 
   if (!_hasStoredTransitions()){
@@ -1738,6 +1814,13 @@ function renderTransitionList(){
     _writeTransitionRepeats(repeats);
   }else{
     _writeTransitionRepeats(repeats);
+  }
+
+  if (!_hasStoredTransitionDurations()){
+    durations = _normalizeTransitionDurations(_defaultTransitionDurations(segments), segments);
+    _writeTransitionDurations(durations);
+  }else{
+    _writeTransitionDurations(durations);
   }
 
   if (!_hasStoredTransitionLock()){
@@ -1772,7 +1855,7 @@ function renderTransitionList(){
 
     const label = document.createElement("div");
     label.className = "hint";
-    label.textContent = `第 ${i}-${i+1} 段过渡音频（重复次数 0-5）`;
+    label.textContent = `第 ${i}-${i+1} 段过渡音频（重复/时长秒）`;
 
     const cell = document.createElement("div");
     cell.className = "transitionCell";
@@ -1800,6 +1883,20 @@ function renderTransitionList(){
       const next = _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
       next[i - 1] = parseInt(repeat.value || "1", 10);
       _writeTransitionRepeats(next);
+    });
+
+    const duration = document.createElement("input");
+    duration.type = "number";
+    duration.min = "0";
+    duration.max = "600";
+    duration.step = "1";
+    duration.className = "transitionDuration";
+    duration.value = String(durations[i - 1] ?? 30);
+    duration.title = "过渡音频时长（秒，0 表示使用原始时长，超过则循环）";
+    duration.addEventListener("input", () => {
+      const next = _normalizeTransitionDurations(_readTransitionDurations(), segments);
+      next[i - 1] = parseFloat(duration.value || "0");
+      _writeTransitionDurations(next);
     });
 
     const fileInput = document.createElement("input");
@@ -1858,12 +1955,13 @@ function renderTransitionList(){
     if (lock){
       input.disabled = true;
       repeat.disabled = true;
+      duration.disabled = true;
       drop.classList.add("disabled");
       drop.style.pointerEvents = "none";
       drop.textContent = "已锁定";
     }
 
-    cell.append(input, repeat, drop, fileInput);
+    cell.append(input, repeat, duration, drop, fileInput);
     row.append(label, cell);
     box.append(row);
   }
@@ -1873,8 +1971,10 @@ function resetTransitionDefaults(){
   const segments = _getSplitSegments();
   const list = _normalizeTransitions(_defaultTransitions(segments), segments);
   const repeats = _normalizeTransitionRepeats(_defaultTransitionRepeats(segments), segments);
+  const durations = _normalizeTransitionDurations(_defaultTransitionDurations(segments), segments);
   _writeTransitions(list);
   _writeTransitionRepeats(repeats);
+  _writeTransitionDurations(durations);
   _writeTransitionLock(true);
   renderTransitionList();
 }
@@ -2848,6 +2948,11 @@ function collectConfig(){
       if (!$("#splitEnabled").checked) return [];
       const segments = _getSplitSegments();
       return _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
+    })(),
+    stitch_transition_durations: (() => {
+      if (!$("#splitEnabled").checked) return [];
+      const segments = _getSplitSegments();
+      return _normalizeTransitionDurations(_readTransitionDurations(), segments);
     })(),
     split_candidates_per_part: (() => {
       if (!$("#splitEnabled").checked) return [];

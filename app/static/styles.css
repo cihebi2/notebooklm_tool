@@ -745,6 +745,15 @@ a.btn{text-decoration:none}
   padding:8px 8px;
   text-align:center;
 }
+.transitionDuration{
+  width:110px;
+  border-radius:12px;
+  border:1px solid var(--stroke);
+  background: rgba(0,0,0,.20);
+  color: rgba(244,242,255,.92);
+  padding:8px 8px;
+  text-align:center;
+}
 .transitionDrop{
   flex:0 0 140px;
   text-align:center;
