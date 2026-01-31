@@ -27,6 +27,7 @@ const STORAGE_PROMPT_PRESET = "notebooklm.promptPreset";
 const STORAGE_PROMPT_NAME = "notebooklm.promptName";
 const STORAGE_SPLIT_PARTS = "notebooklm.splitPartPrompts";
 const STORAGE_SPLIT_CANDIDATES = "notebooklm.splitCandidatesPerPart";
+const STORAGE_STITCH_TRANSITIONS = "notebooklm.stitchTransitions";
 const STORAGE_LAST_RUN_CONFIG = "notebooklm.lastRunConfig";
 const STALL_WARNING_MS = 20 * 60 * 1000;
 
@@ -105,6 +106,9 @@ function collectLastRunConfig(){
     split_keep_parts: !!$("#splitKeepParts")?.checked,
     split_manual_stitch: !!$("#splitManualStitch")?.checked,
     split_candidates_per_part: _normalizeSplitCandidates(_readSplitCandidates(), segs),
+    stitch_transition_enabled: !!$("#stitchTransitionEnabled")?.checked,
+    stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "1"),
+    stitch_transition_files: _normalizeTransitions(_readTransitions(), segs),
     language: $("#lang")?.value || "zh",
     audio_length: $("#audioLength")?.value || "long",
     audio_format: $("#audioFormat")?.value || "deep_dive",
@@ -143,7 +147,11 @@ function restoreLastRunConfig(){
     if (Array.isArray(cfg.split_candidates_per_part)){
       _writeSplitCandidates(_normalizeSplitCandidates(cfg.split_candidates_per_part, segs));
     }
+    if (Array.isArray(cfg.stitch_transition_files)){
+      _writeTransitions(_normalizeTransitions(cfg.stitch_transition_files, segs));
+    }
     renderSplitPromptList();
+    renderTransitionList();
     updateSplitPromptPreview();
 
     if ($("#lang") && cfg.language) $("#lang").value = String(cfg.language);
@@ -160,6 +168,10 @@ function restoreLastRunConfig(){
     }
     if ($("#silenceThreshold") && cfg.silence_threshold_db != null){
       $("#silenceThreshold").value = String(cfg.silence_threshold_db);
+    }
+    if ($("#stitchTransitionEnabled")) $("#stitchTransitionEnabled").checked = !!cfg.stitch_transition_enabled;
+    if ($("#stitchTransitionFade") && cfg.stitch_transition_fade_seconds != null){
+      $("#stitchTransitionFade").value = String(cfg.stitch_transition_fade_seconds);
     }
 
     const byId = new Map();
@@ -288,7 +300,8 @@ function tagFor(type){
   if ([
     "job_started","generation_started","downloaded","source_ready","notebook_created","attempt_started","job_queued",
     "split_detected","split_source_ready","part_attempt_started","part_generation_started","part_downloaded","part_rejected","stitch_started",
-    "source_fallback_file","split_waiting_selection","split_stitch_selection_submitted","split_stitch_selection_received"
+    "source_fallback_file","split_waiting_selection","split_stitch_selection_submitted","split_stitch_selection_received",
+    "stitch_transition_missing"
   ].includes(type)) return ["RUN","warn"];
   return ["INFO",""];
 }
@@ -347,6 +360,8 @@ function lineText(ev){
     }
     case "part_rejected": return `${a} 第 ${ev.part} 段 ⛔ 太短：${ev.duration_minutes} min (阈值 ${ev.min_duration_minutes} min)`;
     case "stitch_started": return `${a} 开始拼接 ${ev.parts?.length || ""} 段 → ${ev.output || ""}`;
+    case "stitch_transition_missing":
+      return `${a} 过渡音频缺失：${ev.gap || ""} ${ev.path || ""}`.trim();
     case "stitch_completed": return `${a} 拼接完成：${ev.duration_minutes} min (${ev.method || ""})`;
     case "stitch_rejected": return `${a} 拼接后仍太短：${ev.duration_minutes} min (阈值 ${ev.min_duration_minutes} min)`;
     case "silence_ok":
@@ -1476,6 +1491,16 @@ function _writeSplitCandidates(cands){
   }catch{}
 }
 
+function _readTransitions(){
+  return _readJSON(STORAGE_STITCH_TRANSITIONS, []);
+}
+
+function _writeTransitions(list){
+  try{
+    localStorage.setItem(STORAGE_STITCH_TRANSITIONS, JSON.stringify(list || []));
+  }catch{}
+}
+
 function _getSplitSegments(){
   const n = parseInt($("#splitSegments")?.value || "3", 10);
   return Number.isFinite(n) && n > 0 ? n : 3;
@@ -1496,6 +1521,13 @@ function _normalizeSplitCandidates(cands, segments){
   }
   while (out.length < segments) out.push(1);
   return out;
+}
+
+function _normalizeTransitions(list, segments){
+  const gaps = Math.max(0, (Number(segments) || 0) - 1);
+  const out = Array.isArray(list) ? list.slice(0, gaps) : [];
+  while (out.length < gaps) out.push("");
+  return out.map(v => String(v || ""));
 }
 
 function _buildSplitPreviewContent(partIndex, parts){
@@ -1593,6 +1625,44 @@ function renderSplitPromptList(){
 
     card.append(header, input, previewLabel, preview);
     box.append(card);
+  }
+}
+
+function renderTransitionList(){
+  const box = $("#stitchTransitionList");
+  if (!box) return;
+  const segments = _getSplitSegments();
+  const gaps = Math.max(0, segments - 1);
+  const list = _normalizeTransitions(_readTransitions(), segments);
+  _writeTransitions(list);
+
+  box.innerHTML = "";
+  if (gaps <= 0){
+    box.innerHTML = `<div class="hint">当前分段不足 2 段，无需过渡音频。</div>`;
+    return;
+  }
+
+  for (let i=1;i<=gaps;i++){
+    const row = document.createElement("div");
+    row.className = "transitionRow";
+
+    const label = document.createElement("div");
+    label.className = "hint";
+    label.textContent = `第 ${i}-${i+1} 段过渡音频路径`;
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "transitionInput";
+    input.placeholder = "例如 C:\\path\\to\\transition.wav";
+    input.value = list[i - 1] || "";
+    input.addEventListener("input", () => {
+      const next = _normalizeTransitions(_readTransitions(), segments);
+      next[i - 1] = String(input.value || "");
+      _writeTransitions(next);
+    });
+
+    row.append(label, input);
+    box.append(row);
   }
 }
 
@@ -2554,6 +2624,13 @@ function collectConfig(){
     split_output_format: $("#splitOutputFormat").value,
     split_keep_parts: $("#splitKeepParts").checked,
     split_manual_stitch: ($("#splitEnabled").checked && $("#splitManualStitch").checked),
+    stitch_transition_enabled: ($("#splitEnabled").checked && $("#stitchTransitionEnabled")?.checked),
+    stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "1"),
+    stitch_transition_files: (() => {
+      if (!$("#splitEnabled").checked) return [];
+      const segments = _getSplitSegments();
+      return _normalizeTransitions(_readTransitions(), segments);
+    })(),
     split_candidates_per_part: (() => {
       if (!$("#splitEnabled").checked) return [];
       const segments = _getSplitSegments();
@@ -2910,6 +2987,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   hydratePrompts();
   await loadFixedPrompt({fallbackToDefault:true});
   await loadSplitPrompt({fallbackToDefault:true});
+  renderTransitionList();
   wireDropzone();
   wireCounters();
   wireTargetMode();
@@ -2930,10 +3008,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("#resetSplitPromptBtn")?.addEventListener("click", resetSplitPrompt);
   $("#splitSegments")?.addEventListener("change", () => {
     renderSplitPromptList();
+    renderTransitionList();
     updateSplitPromptPreview();
   });
   $("#splitSegments")?.addEventListener("input", () => {
     renderSplitPromptList();
+    renderTransitionList();
     updateSplitPromptPreview();
   });
   $("#addAccBtn").addEventListener("click", addAccount);

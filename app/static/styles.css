@@ -681,6 +681,29 @@ a.btn{text-decoration:none}
   min-height:140px;
 }
 
+.transitionList{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.transitionRow{
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:14px;
+  background: rgba(0,0,0,.14);
+  padding:10px;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.transitionInput{
+  width:100%;
+  border-radius:12px;
+  border:1px solid var(--stroke);
+  background: rgba(0,0,0,.20);
+  color: rgba(244,242,255,.92);
+  padding:8px 10px;
+}
+
 .stitchPanel{
   border:1px solid var(--stroke);
   border-radius:18px;

@@ -12,7 +12,7 @@ from notebooklm import AudioFormat, AudioLength, NotebookLMClient, RPCError
 from notebooklm.types import GenerationStatus
 
 from .accounts_store import AccountsStore
-from .utils.audio_concat import concat_audio
+from .utils.audio_concat import concat_audio, concat_audio_with_transitions
 from .utils.audio_duration import get_audio_duration
 from .utils.silence_detect import detect_silence_segments, segments_to_payload
 from .utils.notebooklm_download import _extract_audio_download_url, download_audio_with_storage
@@ -205,6 +205,9 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
     split_keep_parts = bool(getattr(cfg, "split_keep_parts", True))
     split_manual_stitch = bool(getattr(cfg, "split_manual_stitch", False))
     split_task_timeout = max(1200.0, min(3600.0, split_min_seconds * 2.0))
+    transition_enabled = bool(getattr(cfg, "stitch_transition_enabled", False))
+    transition_fade_seconds = float(getattr(cfg, "stitch_transition_fade_seconds", 1.0))
+    transition_files = list(getattr(cfg, "stitch_transition_files", []) or [])
     silence_check_enabled = bool(getattr(cfg, "silence_check_enabled", True))
     silence_min_duration_s = float(getattr(cfg, "silence_min_duration_s", 5.0))
     silence_threshold_db = float(getattr(cfg, "silence_threshold_db", -50.0))
@@ -239,6 +242,18 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
 
     async def publish(event: dict[str, Any]) -> None:
         await job.publish(event)
+
+    def _transition_path_for_gap(left_part_index: int) -> tuple[Path | None, str]:
+        if not transition_enabled:
+            return None, ""
+        idx = left_part_index - 1
+        if idx < 0 or idx >= len(transition_files):
+            return None, ""
+        raw = str(transition_files[idx] or "").strip()
+        if not raw:
+            return None, ""
+        path = Path(raw)
+        return (path if path.exists() else None), raw
 
     async def check_silence(
         *,
@@ -374,7 +389,12 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             raise RuntimeError("no valid accounts available")
 
         async def stitch_episode(
-            *, episode_index: int, parts_paths: list[Path], enforce_min_duration: bool
+            *,
+            episode_index: int,
+            parts_paths: list[Path],
+            part_indices: list[int],
+            transition_paths: list[Path | None],
+            enforce_min_duration: bool,
         ) -> tuple[Path, float]:
             output_format = (
                 split_output_format if split_output_format in {"mp3", "mp4", "m4a"} else "m4a"
@@ -390,10 +410,24 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                     "parts": [p.name for p in parts_paths],
                     "output": merged_tmp.name,
                     "output_format": output_format,
+                    "transition_enabled": transition_enabled,
+                    "transition_fade_seconds": transition_fade_seconds,
+                    "transition_files": [
+                        str(p.name) if isinstance(p, Path) else "" for p in transition_paths
+                    ],
                 }
             )
-
-            result = concat_audio(parts_paths, merged_tmp, output_format=output_format)
+            use_transitions = transition_enabled and any(isinstance(p, Path) for p in transition_paths)
+            if use_transitions:
+                result = concat_audio_with_transitions(
+                    parts_paths,
+                    transition_paths,
+                    merged_tmp,
+                    output_format=output_format,
+                    fade_seconds=transition_fade_seconds,
+                )
+            else:
+                result = concat_audio(parts_paths, merged_tmp, output_format=output_format)
             merged_duration = get_audio_duration(result.output_path)
             merged_minutes = merged_duration.minutes
             await publish(
@@ -1236,10 +1270,28 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                     raise RuntimeError(f"invalid selection for part {idx}: {filename}")
                 parts_paths.append(cand["path"])
 
+            transition_paths: list[Path | None] = []
+            for i in range(max(0, len(enabled_parts) - 1)):
+                left = enabled_parts[i]
+                path, raw = _transition_path_for_gap(left)
+                if transition_enabled and raw and path is None:
+                    await publish(
+                        {
+                            "type": "stitch_transition_missing",
+                            "ts": _now_iso(),
+                            "episode": episode_index,
+                            "gap": f"{left}-{left + 1}",
+                            "path": raw,
+                        }
+                    )
+                transition_paths.append(path)
+
             enforce_min_duration = len(enabled_parts) == len(parts_by_index)
             stitched_path, stitched_minutes = await stitch_episode(
                 episode_index=episode_index,
                 parts_paths=parts_paths,
+                part_indices=enabled_parts,
+                transition_paths=transition_paths,
                 enforce_min_duration=enforce_min_duration,
             )
 
@@ -1958,6 +2010,24 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 raise RuntimeError(f"invalid selection for part {idx}: {filename}")
                             parts_paths.append(cand["path"])
 
+                        transition_paths: list[Path | None] = []
+                        for i in range(max(0, len(enabled_parts) - 1)):
+                            left = enabled_parts[i]
+                            path, raw = _transition_path_for_gap(left)
+                            if transition_enabled and raw and path is None:
+                                await publish(
+                                    {
+                                        "type": "stitch_transition_missing",
+                                        "ts": _now_iso(),
+                                        "account_id": account.id,
+                                        "notebook_id": nb.id,
+                                        "episode": episode_index,
+                                        "gap": f"{left}-{left + 1}",
+                                        "path": raw,
+                                    }
+                                )
+                            transition_paths.append(path)
+
                         output_format = (
                             split_output_format
                             if split_output_format in {"mp3", "mp4", "m4a"}
@@ -1977,10 +2047,27 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 "parts": [p.name for p in parts_paths],
                                 "output": merged_tmp.name,
                                 "output_format": output_format,
+                                "transition_enabled": transition_enabled,
+                                "transition_fade_seconds": transition_fade_seconds,
+                                "transition_files": [
+                                    str(p.name) if isinstance(p, Path) else "" for p in transition_paths
+                                ],
                             }
                         )
 
-                        result = concat_audio(parts_paths, merged_tmp, output_format=output_format)
+                        use_transitions = transition_enabled and any(
+                            isinstance(p, Path) for p in transition_paths
+                        )
+                        if use_transitions:
+                            result = concat_audio_with_transitions(
+                                parts_paths,
+                                transition_paths,
+                                merged_tmp,
+                                output_format=output_format,
+                                fade_seconds=transition_fade_seconds,
+                            )
+                        else:
+                            result = concat_audio(parts_paths, merged_tmp, output_format=output_format)
                         merged_duration = get_audio_duration(result.output_path)
                         merged_minutes = merged_duration.minutes
                         await publish(
