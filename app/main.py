@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import uuid
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .accounts_store import AccountsStore
+from .concat_service import ConcatService
 from .config import get_paths
 from .jobs import JobConfig, JobManager
 from .login_sessions import LoginSessionManager
@@ -26,12 +29,14 @@ accounts_store = AccountsStore(paths)
 job_manager = JobManager(paths, accounts_store)
 login_manager = LoginSessionManager(paths.data_dir / "login_sessions")
 prompts_path = paths.data_dir / "prompts.json"
+concat_service = ConcatService(paths)
 default_prompts_path = paths.base_dir / "assets" / "prompts.default.json"
 
 app = FastAPI(title="Podcast Studio (NotebookLM)")
 
 static_dir = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+concat_static_dir = static_dir / "concat"
 
 
 def _now_iso() -> str:
@@ -487,3 +492,212 @@ async def download_file(job_id: str, filename: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="file not found")
     return FileResponse(path)
+
+
+# =============================================================================
+# Concat Tool (早间新闻拼接工作台)
+# =============================================================================
+
+
+@app.get("/concat", response_class=HTMLResponse)
+@app.get("/concat/", response_class=HTMLResponse)
+async def concat_index() -> str:
+    path = concat_static_dir / "index.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="concat ui not found")
+    return path.read_text(encoding="utf-8")
+
+
+@app.get("/concat/app.js")
+async def concat_app_js() -> FileResponse:
+    path = concat_static_dir / "app.js"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="concat app.js not found")
+    return FileResponse(path, media_type="application/javascript")
+
+
+@app.get("/concat/style.css")
+async def concat_style_css() -> FileResponse:
+    path = concat_static_dir / "style.css"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="concat style.css not found")
+    return FileResponse(path, media_type="text/css")
+
+
+@app.post("/concat/api/jobs")
+async def concat_create_job(
+    mainAudio: list[UploadFile] = File(...),
+    repeat: str = Form("3"),
+    quality: str = Form("5"),
+    outputName: str = Form(""),
+) -> dict[str, Any]:
+    files = [f for f in (mainAudio or []) if f and f.filename]
+    if not files:
+        raise HTTPException(status_code=400, detail="未找到上传文件 mainAudio（可上传 1~10 个，按顺序合并）。")
+    if len(files) > 10:
+        raise HTTPException(status_code=400, detail="mainAudio 最多上传 10 个文件。")
+
+    try:
+        repeat_n = int(repeat)
+    except Exception:
+        repeat_n = 3
+    if repeat_n < 1 or repeat_n > 20:
+        raise HTTPException(status_code=400, detail="repeat 需在 1~20 之间。")
+
+    try:
+        quality_n = int(quality)
+    except Exception:
+        quality_n = 5
+    if quality_n < 0 or quality_n > 9:
+        raise HTTPException(status_code=400, detail="quality 需在 0~9 之间（数值越小质量越高）。")
+
+    # create job dir early
+    job_id = uuid.uuid4().hex
+    job_dir = concat_service.jobs_dir / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    upload_paths: list[Path] = []
+    for idx, f in enumerate(files, start=1):
+        ext = Path(f.filename or "").suffix or ".audio"
+        dest = job_dir / f"main_{idx}{ext}"
+        with dest.open("wb") as out:
+            while True:
+                chunk = await f.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+        upload_paths.append(dest)
+
+    loop = asyncio.get_running_loop()
+    job = concat_service.create_job(
+        upload_paths=upload_paths,
+        repeat=repeat_n,
+        quality=quality_n,
+        output_name=outputName or "",
+        loop=loop,
+        job_id=job_id,
+        job_dir=job_dir,
+    )
+
+    return {
+        "ok": True,
+        "jobId": job.id,
+        "eventsUrl": f"/concat/api/jobs/{job.id}/events",
+        "statusUrl": f"/concat/api/jobs/{job.id}",
+        "outputFile": job.output_file,
+        "outputPath": str(job.output_path),
+        "downloadUrl": f"/concat/download/{job.output_file}",
+    }
+
+
+@app.get("/concat/api/jobs/{job_id}")
+async def concat_job_status(job_id: str) -> dict[str, Any]:
+    job = concat_service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {
+        "ok": True,
+        "jobId": job.id,
+        "stage": job.stage,
+        "message": job.message,
+        "progress": job.progress,
+        "done": job.done,
+        "error": job.error,
+        "outputFile": job.output_file,
+        "outputPath": str(job.output_path),
+        "downloadUrl": f"/concat/download/{job.output_file}",
+        "durationSeconds": job.output_duration_seconds,
+        "latestTxtPath": str(concat_service.latest_txt_path),
+    }
+
+
+@app.get("/concat/api/jobs/{job_id}/events")
+async def concat_job_events(job_id: str) -> StreamingResponse:
+    job = concat_service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    async def event_gen():
+        while True:
+            ev = await job.events.get()
+            if ev.get("type") == "__close__":
+                break
+            payload = json.dumps(ev.get("data") or {}, ensure_ascii=False)
+            yield f"event: {ev.get('type')}\n"
+            yield f"data: {payload}\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@app.get("/concat/download/{filename}")
+async def concat_download(filename: str) -> FileResponse:
+    safe = Path(filename).name
+    path = concat_service.output_dir / safe
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(path, media_type="audio/mpeg", filename=safe)
+
+
+@app.get("/concat/api/fixed")
+async def concat_fixed_list() -> dict[str, Any]:
+    return {"ok": True, "items": concat_service.fixed_items()}
+
+
+@app.get("/concat/fixed/{kind}")
+async def concat_fixed_file(kind: str) -> FileResponse:
+    path = {
+        "intro": concat_service.intro_path,
+        "outro": concat_service.outro_path,
+        "tail": concat_service.tail_path,
+    }.get(kind)
+    if not path or not path.exists():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(path, media_type="audio/mpeg", filename=path.name)
+
+
+@app.post("/concat/api/fixed/{kind}")
+async def concat_fixed_upload(kind: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="未找到上传文件 file。")
+    tmp = concat_service.jobs_dir / f"{uuid.uuid4().hex}.upload.mp3"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+    try:
+        item = concat_service.replace_fixed(kind, tmp)
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    tmp.unlink(missing_ok=True)
+    return {"ok": True, "item": item}
+
+
+@app.post("/concat/api/open-output")
+async def concat_open_output(file: str | None = None) -> dict[str, Any]:
+    try:
+        if file:
+            safe = Path(file).name
+            path = concat_service.output_dir / safe
+            if path.exists():
+                subprocess.Popen(["explorer.exe", f"/select,{path}"], shell=False)
+                return {"ok": True}
+        subprocess.Popen(["explorer.exe", str(concat_service.output_dir)], shell=False)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/concat/api/info")
+async def concat_info() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "assetsDir": str(concat_service.assets_dir),
+        "outputDir": str(concat_service.output_dir),
+        "ffmpeg": concat_service.ffmpeg,
+        "ffprobe": concat_service.ffprobe,
+        "jobs": len(concat_service.jobs),
+    }

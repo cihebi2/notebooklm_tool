@@ -3216,6 +3216,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     await hydrateLastJob();
     await refreshJobs();
     $("#startBtn").addEventListener("click", startJob);
+    $("#saveConfigBtn")?.addEventListener("click", () => {
+      persistLastRunConfig();
+      alert("已保存当前配置");
+    });
     $("#stitchTransitionReset")?.addEventListener("click", resetTransitionDefaults);
     $("#stitchTransitionLock")?.addEventListener("change", () => {
       _writeTransitionLock(!!$("#stitchTransitionLock")?.checked);

@@ -1,0 +1,212 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b0b12" />
+    <title>早间新闻拼接工作台（本地）</title>
+    <link rel="stylesheet" href="./style.css?v=3" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="hero">
+        <div class="hero-top">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true"></div>
+            <div class="brand-text">
+              <div class="eyebrow">LOCAL AUDIO STUDIO</div>
+              <h1>早间新闻拼接工作台</h1>
+              <p class="hero-sub">
+                固定片头 / 主音频（支持多段合并 + 重复） / 片尾 / 片尾音乐 → 一键导出 <code>.mp3</code>
+              </p>
+            </div>
+          </div>
+          <div class="hero-actions">
+            <a class="ghost-btn" href="/concat/api/info" target="_blank" rel="noreferrer">诊断信息</a>
+          </div>
+        </div>
+      </header>
+
+      <div class="layout">
+        <div class="col">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">主音频</div>
+                <div class="panel-desc muted">
+                  支持两种方式：单段主音频直接拼接；或把多段（例如 3 个 15min 的 <code>.m4a</code>）先合并成一个“第二段”，再与固定片头/片尾/片尾音乐拼接。
+                </div>
+              </div>
+              <div class="pill muted">完全本地处理</div>
+            </div>
+
+            <section class="drop-grid">
+              <section id="dropSingle" class="drop">
+                <div class="drop-head">
+                  <div>
+                    <div class="drop-title">单段主音频</div>
+                    <div class="drop-sub">拖拽 / 点击选择（重复会覆盖）</div>
+                  </div>
+                  <div class="drop-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4 12h2l2-5 3 10 3-12 3 12 3-7 2 2h2" />
+                    </svg>
+                  </div>
+                </div>
+                <input id="fileSingle" type="file" accept="audio/*" />
+              </section>
+
+              <section id="dropMulti" class="drop">
+                <div class="drop-head">
+                  <div>
+                    <div class="drop-title">多段主音频</div>
+                    <div class="drop-sub">拖拽 / 点击选择（可多次累加，按文件名排序，拼成第二段）</div>
+                  </div>
+                  <div class="drop-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M7 8h12" />
+                      <path d="M5 12h14" />
+                      <path d="M7 16h12" />
+                      <path d="M5 6v12" />
+                    </svg>
+                  </div>
+                </div>
+                <input id="fileMulti" type="file" accept="audio/*" multiple />
+              </section>
+            </section>
+
+            <div class="drop-meta">
+              <button id="multiClear" class="secondary mini" type="button" disabled>清空多段</button>
+              <span id="multiHint" class="muted">未添加</span>
+            </div>
+            <ol id="multiList" class="file-list"></ol>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">导出设置</div>
+                <div class="panel-desc muted">质量越高文件越大；一般用 5 就够。</div>
+              </div>
+              <div class="pill pill-accent">输出 MP3</div>
+            </div>
+
+            <section class="grid">
+              <label class="field">
+                <span class="field-label">重复次数（主音频）</span>
+                <input id="repeat" type="number" min="1" max="20" value="3" />
+              </label>
+              <label class="field">
+                <span class="field-label">MP3 质量（2-9，越小越高）</span>
+                <select id="quality">
+                  <option value="2">2（高）</option>
+                  <option value="5" selected>5（推荐）</option>
+                  <option value="7">7（更小文件）</option>
+                </select>
+              </label>
+              <label class="field field-wide">
+                <span class="field-label">输出文件名（默认与主音频同名 / 多段默认明日日期）</span>
+                <input id="outputName" type="text" placeholder="例如：20251226-刘润商业早新闻.mp3" />
+              </label>
+            </section>
+
+            <div class="actions">
+              <button id="build" disabled>开始拼接</button>
+              <button id="openOutput" class="secondary" disabled>打开输出文件夹</button>
+            </div>
+          </section>
+
+          <section class="panel fixed-card">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">固定音频</div>
+                <div class="panel-desc muted">片头 / 片尾 / 片尾音乐（可随时更换，立即生效）</div>
+              </div>
+              <div class="pill muted">mp3</div>
+            </div>
+
+            <div class="fixed-grid">
+              <div class="fixed-item">
+                <div class="fixed-head">
+                  <div>
+                    <div class="fixed-title">片头</div>
+                    <div id="fixedIntroInfo" class="muted">加载中…</div>
+                  </div>
+                  <div class="fixed-actions">
+                    <button id="fixedIntroPick" class="secondary mini" type="button">更换</button>
+                    <input id="fixedIntroFile" type="file" accept=".mp3,audio/mpeg" />
+                  </div>
+                </div>
+                <audio id="fixedIntroPlayer" class="fixed-audio" controls preload="none"></audio>
+              </div>
+
+              <div class="fixed-item">
+                <div class="fixed-head">
+                  <div>
+                    <div class="fixed-title">片尾</div>
+                    <div id="fixedOutroInfo" class="muted">加载中…</div>
+                  </div>
+                  <div class="fixed-actions">
+                    <button id="fixedOutroPick" class="secondary mini" type="button">更换</button>
+                    <input id="fixedOutroFile" type="file" accept=".mp3,audio/mpeg" />
+                  </div>
+                </div>
+                <audio id="fixedOutroPlayer" class="fixed-audio" controls preload="none"></audio>
+              </div>
+
+              <div class="fixed-item">
+                <div class="fixed-head">
+                  <div>
+                    <div class="fixed-title">片尾音乐</div>
+                    <div id="fixedTailInfo" class="muted">加载中…</div>
+                  </div>
+                  <div class="fixed-actions">
+                    <button id="fixedTailPick" class="secondary mini" type="button">更换</button>
+                    <input id="fixedTailFile" type="file" accept=".mp3,audio/mpeg" />
+                  </div>
+                </div>
+                <audio id="fixedTailPlayer" class="fixed-audio" controls preload="none"></audio>
+              </div>
+            </div>
+
+            <div class="muted tip">提示：更换后会立刻生效；如果你之前跑过任务，缓存会在下次自动更新。</div>
+          </section>
+        </div>
+
+        <div class="col">
+          <section class="panel status-card">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">运行状态</div>
+                <div class="panel-desc muted">进度条为本机 ffmpeg 处理进度。</div>
+              </div>
+              <div class="pill pill-ghost">SSE 实时</div>
+            </div>
+
+            <div class="rows">
+              <div class="row"><span class="k">单段主音频</span><span id="pickedSingle" class="v muted">未选择</span></div>
+              <div class="row"><span class="k">多段主音频</span><span id="pickedMulti" class="v muted">未添加</span></div>
+              <div class="row"><span class="k">当前使用</span><span id="pickedActive" class="v muted">未选择</span></div>
+              <div class="row"><span class="k">状态</span><span id="status" class="v muted">等待</span></div>
+            </div>
+
+            <div class="progress-wrap" aria-hidden="true">
+              <div class="progress-track"><div id="bar" class="progress-bar" style="width: 0%"></div></div>
+              <div id="progressText" class="muted progress-text">0%</div>
+            </div>
+            <div id="result" class="result"></div>
+          </section>
+
+          <footer class="footer muted">
+            <span>本工具在本机使用 ffmpeg 完成转码/拼接。</span>
+            <span class="sep" aria-hidden="true">·</span>
+            <span>保持此窗口打开即可使用网页。</span>
+          </footer>
+        </div>
+      </div>
+    </main>
+
+    <script src="./app.js?v=3"></script>
+  </body>
+</html>
+
