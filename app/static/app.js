@@ -118,6 +118,7 @@ function collectLastRunConfig(){
     stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "3"),
     stitch_transition_files: _normalizeTransitions(_readTransitions(), segs),
     stitch_transition_repeats: _normalizeTransitionRepeats(_readTransitionRepeats(), segs),
+    stitch_transition_lock: !!$("#stitchTransitionLock")?.checked,
     language: $("#lang")?.value || "zh",
     audio_length: $("#audioLength")?.value || "long",
     audio_format: $("#audioFormat")?.value || "deep_dive",
@@ -162,6 +163,9 @@ function restoreLastRunConfig(){
     if (Array.isArray(cfg.stitch_transition_repeats)){
       _writeTransitionRepeats(_normalizeTransitionRepeats(cfg.stitch_transition_repeats, segs));
     }
+    if (cfg.stitch_transition_lock != null){
+      _writeTransitionLock(!!cfg.stitch_transition_lock);
+    }
     renderSplitPromptList();
     renderTransitionList();
     updateSplitPromptPreview();
@@ -184,6 +188,9 @@ function restoreLastRunConfig(){
     if ($("#stitchTransitionEnabled")) $("#stitchTransitionEnabled").checked = !!cfg.stitch_transition_enabled;
     if ($("#stitchTransitionFade") && cfg.stitch_transition_fade_seconds != null){
       $("#stitchTransitionFade").value = String(cfg.stitch_transition_fade_seconds);
+    }
+    if ($("#stitchTransitionLock") && cfg.stitch_transition_lock != null){
+      $("#stitchTransitionLock").checked = !!cfg.stitch_transition_lock;
     }
 
     const byId = new Map();
