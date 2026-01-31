@@ -206,8 +206,9 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
     split_manual_stitch = bool(getattr(cfg, "split_manual_stitch", False))
     split_task_timeout = max(1200.0, min(3600.0, split_min_seconds * 2.0))
     transition_enabled = bool(getattr(cfg, "stitch_transition_enabled", False))
-    transition_fade_seconds = float(getattr(cfg, "stitch_transition_fade_seconds", 1.0))
+    transition_fade_seconds = float(getattr(cfg, "stitch_transition_fade_seconds", 3.0))
     transition_files = list(getattr(cfg, "stitch_transition_files", []) or [])
+    transition_repeats = list(getattr(cfg, "stitch_transition_repeats", []) or [])
     silence_check_enabled = bool(getattr(cfg, "silence_check_enabled", True))
     silence_min_duration_s = float(getattr(cfg, "silence_min_duration_s", 5.0))
     silence_threshold_db = float(getattr(cfg, "silence_threshold_db", -50.0))
@@ -254,6 +255,22 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             return None, ""
         path = Path(raw)
         return (path if path.exists() else None), raw
+
+    def _transition_repeat_for_gap(left_part_index: int) -> int:
+        if not transition_enabled:
+            return 0
+        idx = left_part_index - 1
+        if idx < 0 or idx >= len(transition_repeats):
+            return 1
+        try:
+            n = int(transition_repeats[idx])
+        except Exception:
+            n = 1
+        if n < 0:
+            n = 0
+        if n > 5:
+            n = 5
+        return n
 
     async def check_silence(
         *,
@@ -394,6 +411,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             parts_paths: list[Path],
             part_indices: list[int],
             transition_paths: list[Path | None],
+            transition_repeats: list[int],
             enforce_min_duration: bool,
         ) -> tuple[Path, float]:
             output_format = (
@@ -415,6 +433,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                     "transition_files": [
                         str(p.name) if isinstance(p, Path) else "" for p in transition_paths
                     ],
+                    "transition_repeats": transition_repeats,
                 }
             )
             use_transitions = transition_enabled and any(isinstance(p, Path) for p in transition_paths)
@@ -425,6 +444,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                     merged_tmp,
                     output_format=output_format,
                     fade_seconds=transition_fade_seconds,
+                    transition_repeats=transition_repeats,
                 )
             else:
                 result = concat_audio(parts_paths, merged_tmp, output_format=output_format)
@@ -1271,6 +1291,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                 parts_paths.append(cand["path"])
 
             transition_paths: list[Path | None] = []
+            transition_repeats: list[int] = []
             for i in range(max(0, len(enabled_parts) - 1)):
                 left = enabled_parts[i]
                 path, raw = _transition_path_for_gap(left)
@@ -1285,6 +1306,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                         }
                     )
                 transition_paths.append(path)
+                transition_repeats.append(_transition_repeat_for_gap(left))
 
             enforce_min_duration = len(enabled_parts) == len(parts_by_index)
             stitched_path, stitched_minutes = await stitch_episode(
@@ -1292,6 +1314,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                 parts_paths=parts_paths,
                 part_indices=enabled_parts,
                 transition_paths=transition_paths,
+                transition_repeats=transition_repeats,
                 enforce_min_duration=enforce_min_duration,
             )
 
@@ -2011,6 +2034,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                             parts_paths.append(cand["path"])
 
                         transition_paths: list[Path | None] = []
+                        transition_repeats: list[int] = []
                         for i in range(max(0, len(enabled_parts) - 1)):
                             left = enabled_parts[i]
                             path, raw = _transition_path_for_gap(left)
@@ -2027,6 +2051,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     }
                                 )
                             transition_paths.append(path)
+                            transition_repeats.append(_transition_repeat_for_gap(left))
 
                         output_format = (
                             split_output_format
@@ -2052,6 +2077,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 "transition_files": [
                                     str(p.name) if isinstance(p, Path) else "" for p in transition_paths
                                 ],
+                                "transition_repeats": transition_repeats,
                             }
                         )
 
@@ -2065,6 +2091,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 merged_tmp,
                                 output_format=output_format,
                                 fade_seconds=transition_fade_seconds,
+                                transition_repeats=transition_repeats,
                             )
                         else:
                             result = concat_audio(parts_paths, merged_tmp, output_format=output_format)

@@ -350,7 +350,7 @@
               </div>
               <div class="field">
                 <label>淡入淡出（秒）</label>
-                <input id="stitchTransitionFade" type="number" min="0" max="10" step="0.1" value="1" />
+                <input id="stitchTransitionFade" type="number" min="0" max="10" step="0.1" value="3" />
               </div>
               <div class="field">
                 <label>格式</label>
@@ -363,6 +363,9 @@
                 <label>过渡音频路径</label>
                 <div id="stitchTransitionList" class="transitionList"></div>
                 <div class="hint" style="margin-top:6px">按分段顺序插入（例如 1-2 段、2-3 段）。</div>
+                <div style="margin-top:8px">
+                  <button id="stitchTransitionReset" class="btn ghost" type="button">重置为默认过渡音频</button>
+                </div>
               </div>
             </div>
 

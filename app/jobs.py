@@ -37,8 +37,9 @@ class JobConfig(BaseModel):
     split_candidates_per_part: list[int] = Field(default_factory=list)
     split_part_instructions: list[str] = Field(default_factory=list)
     stitch_transition_enabled: bool = False
-    stitch_transition_fade_seconds: float = Field(ge=0, le=10, default=1.0)
+    stitch_transition_fade_seconds: float = Field(ge=0, le=10, default=3.0)
     stitch_transition_files: list[str] = Field(default_factory=list)
+    stitch_transition_repeats: list[int] = Field(default_factory=list)
 
     language: str = Field(default="zh")
     audio_length: str = Field(default="long")  # short|default|long
@@ -87,6 +88,26 @@ class JobConfig(BaseModel):
         cleaned: list[str] = []
         for item in value[:20]:
             cleaned.append(str(item or "").strip())
+        return cleaned
+
+    @field_validator("stitch_transition_repeats")
+    @classmethod
+    def _validate_stitch_transition_repeats(cls, value: list[int] | None) -> list[int]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("stitch_transition_repeats must be a list")
+        cleaned: list[int] = []
+        for item in value[:20]:
+            try:
+                n = int(item)
+            except Exception:
+                n = 1
+            if n < 0:
+                n = 0
+            if n > 5:
+                n = 5
+            cleaned.append(n)
         return cleaned
 
     @field_validator("split_candidates_per_part")

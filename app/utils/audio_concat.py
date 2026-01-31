@@ -74,6 +74,7 @@ def concat_audio_with_transitions(
     output_path: Path,
     output_format: str = "mp3",
     fade_seconds: float = 1.0,
+    transition_repeats: list[int] | None = None,
 ) -> ConcatResult:
     if len(parts) < 1:
         raise ValueError("Need at least 1 part to concatenate")
@@ -88,18 +89,37 @@ def concat_audio_with_transitions(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build sequence: part1, transition1 (optional), part2, transition2, ...
+    def _repeat_for(idx: int) -> int:
+        if not transition_repeats:
+            return 1
+        if idx < 0 or idx >= len(transition_repeats):
+            return 1
+        try:
+            n = int(transition_repeats[idx])
+        except Exception:
+            n = 1
+        if n < 0:
+            n = 0
+        if n > 5:
+            n = 5
+        return n
+
+    # Build sequence: part1, transition1 (optional, repeated), part2, transition2, ...
     sequence: list[tuple[Path, bool, float, float | None]] = []
     for idx, part in enumerate(parts):
         sequence.append((part, False, 0.0, None))
         if idx < len(parts) - 1:
             trans = transitions[idx] if idx < len(transitions) else None
             if trans is not None:
+                repeat = _repeat_for(idx)
+                if repeat <= 0:
+                    continue
                 duration = get_audio_duration(trans).seconds
                 fade = max(0.0, float(fade_seconds))
                 if duration > 0 and fade > 0:
                     fade = min(fade, duration / 2.0)
-                sequence.append((trans, True, fade, duration))
+                for _ in range(repeat):
+                    sequence.append((trans, True, fade, duration))
 
     if len(sequence) == 1:
         # single input; re-encode to target format

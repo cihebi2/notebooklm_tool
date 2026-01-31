@@ -28,6 +28,7 @@ const STORAGE_PROMPT_NAME = "notebooklm.promptName";
 const STORAGE_SPLIT_PARTS = "notebooklm.splitPartPrompts";
 const STORAGE_SPLIT_CANDIDATES = "notebooklm.splitCandidatesPerPart";
 const STORAGE_STITCH_TRANSITIONS = "notebooklm.stitchTransitions";
+const STORAGE_STITCH_TRANSITION_REPEATS = "notebooklm.stitchTransitionRepeats";
 const STORAGE_LAST_RUN_CONFIG = "notebooklm.lastRunConfig";
 const STALL_WARNING_MS = 20 * 60 * 1000;
 const DEFAULT_TRANSITIONS_BY_SEGMENTS = {
@@ -113,8 +114,9 @@ function collectLastRunConfig(){
     split_manual_stitch: !!$("#splitManualStitch")?.checked,
     split_candidates_per_part: _normalizeSplitCandidates(_readSplitCandidates(), segs),
     stitch_transition_enabled: !!$("#stitchTransitionEnabled")?.checked,
-    stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "1"),
+    stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "3"),
     stitch_transition_files: _normalizeTransitions(_readTransitions(), segs),
+    stitch_transition_repeats: _normalizeTransitionRepeats(_readTransitionRepeats(), segs),
     language: $("#lang")?.value || "zh",
     audio_length: $("#audioLength")?.value || "long",
     audio_format: $("#audioFormat")?.value || "deep_dive",
@@ -155,6 +157,9 @@ function restoreLastRunConfig(){
     }
     if (Array.isArray(cfg.stitch_transition_files)){
       _writeTransitions(_normalizeTransitions(cfg.stitch_transition_files, segs));
+    }
+    if (Array.isArray(cfg.stitch_transition_repeats)){
+      _writeTransitionRepeats(_normalizeTransitionRepeats(cfg.stitch_transition_repeats, segs));
     }
     renderSplitPromptList();
     renderTransitionList();
@@ -1507,6 +1512,16 @@ function _writeTransitions(list){
   }catch{}
 }
 
+function _readTransitionRepeats(){
+  return _readJSON(STORAGE_STITCH_TRANSITION_REPEATS, []);
+}
+
+function _writeTransitionRepeats(list){
+  try{
+    localStorage.setItem(STORAGE_STITCH_TRANSITION_REPEATS, JSON.stringify(list || []));
+  }catch{}
+}
+
 function _hasStoredTransitions(){
   try{
     return localStorage.getItem(STORAGE_STITCH_TRANSITIONS) !== null;
@@ -1515,9 +1530,22 @@ function _hasStoredTransitions(){
   }
 }
 
+function _hasStoredTransitionRepeats(){
+  try{
+    return localStorage.getItem(STORAGE_STITCH_TRANSITION_REPEATS) !== null;
+  }catch{
+    return false;
+  }
+}
+
 function _defaultTransitions(segments){
   const key = Number(segments) || 0;
   return (DEFAULT_TRANSITIONS_BY_SEGMENTS[key] || []).slice();
+}
+
+function _defaultTransitionRepeats(segments){
+  const gaps = Math.max(0, (Number(segments) || 0) - 1);
+  return Array.from({length: gaps}, () => 1);
 }
 
 function _getSplitSegments(){
@@ -1547,6 +1575,19 @@ function _normalizeTransitions(list, segments){
   const out = Array.isArray(list) ? list.slice(0, gaps) : [];
   while (out.length < gaps) out.push("");
   return out.map(v => String(v || ""));
+}
+
+function _normalizeTransitionRepeats(list, segments){
+  const gaps = Math.max(0, (Number(segments) || 0) - 1);
+  const out = Array.isArray(list) ? list.slice(0, gaps) : [];
+  while (out.length < gaps) out.push(1);
+  return out.map(v => {
+    const n = parseInt(v || "1", 10);
+    if (!Number.isFinite(n)) return 1;
+    if (n < 0) return 0;
+    if (n > 5) return 5;
+    return n;
+  });
 }
 
 function _buildSplitPreviewContent(partIndex, parts){
@@ -1653,17 +1694,23 @@ function renderTransitionList(){
   const segments = _getSplitSegments();
   const gaps = Math.max(0, segments - 1);
   let list = _normalizeTransitions(_readTransitions(), segments);
+  let repeats = _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
 
   if (!_hasStoredTransitions()){
     const defaults = _defaultTransitions(segments);
     if (defaults.length){
       list = _normalizeTransitions(defaults, segments);
-      _writeTransitions(list);
-    }else{
-      _writeTransitions(list);
     }
+    _writeTransitions(list);
   }else{
     _writeTransitions(list);
+  }
+
+  if (!_hasStoredTransitionRepeats()){
+    repeats = _normalizeTransitionRepeats(_defaultTransitionRepeats(segments), segments);
+    _writeTransitionRepeats(repeats);
+  }else{
+    _writeTransitionRepeats(repeats);
   }
 
   box.innerHTML = "";
@@ -1703,6 +1750,20 @@ function renderTransitionList(){
       const next = _normalizeTransitions(_readTransitions(), segments);
       next[i - 1] = String(input.value || "");
       _writeTransitions(next);
+    });
+
+    const repeat = document.createElement("input");
+    repeat.type = "number";
+    repeat.min = "0";
+    repeat.max = "5";
+    repeat.step = "1";
+    repeat.className = "transitionRepeat";
+    repeat.value = String(repeats[i - 1] ?? 1);
+    repeat.title = "过渡音频重复次数（0 表示不插入）";
+    repeat.addEventListener("input", () => {
+      const next = _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
+      next[i - 1] = parseInt(repeat.value || "1", 10);
+      _writeTransitionRepeats(next);
     });
 
     const fileInput = document.createElement("input");
@@ -1758,10 +1819,19 @@ function renderTransitionList(){
       await handleFile(file);
     });
 
-    cell.append(input, drop, fileInput);
+    cell.append(input, repeat, drop, fileInput);
     row.append(label, cell);
     box.append(row);
   }
+}
+
+function resetTransitionDefaults(){
+  const segments = _getSplitSegments();
+  const list = _normalizeTransitions(_defaultTransitions(segments), segments);
+  const repeats = _normalizeTransitionRepeats(_defaultTransitionRepeats(segments), segments);
+  _writeTransitions(list);
+  _writeTransitionRepeats(repeats);
+  renderTransitionList();
 }
 
 function updateSplitPromptPreview(){
@@ -2723,11 +2793,16 @@ function collectConfig(){
     split_keep_parts: $("#splitKeepParts").checked,
     split_manual_stitch: ($("#splitEnabled").checked && $("#splitManualStitch").checked),
     stitch_transition_enabled: ($("#splitEnabled").checked && $("#stitchTransitionEnabled")?.checked),
-    stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "1"),
+    stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "3"),
     stitch_transition_files: (() => {
       if (!$("#splitEnabled").checked) return [];
       const segments = _getSplitSegments();
       return _normalizeTransitions(_readTransitions(), segments);
+    })(),
+    stitch_transition_repeats: (() => {
+      if (!$("#splitEnabled").checked) return [];
+      const segments = _getSplitSegments();
+      return _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
     })(),
     split_candidates_per_part: (() => {
       if (!$("#splitEnabled").checked) return [];
@@ -3085,17 +3160,18 @@ window.addEventListener("DOMContentLoaded", async () => {
   hydratePrompts();
   await loadFixedPrompt({fallbackToDefault:true});
   await loadSplitPrompt({fallbackToDefault:true});
-  renderTransitionList();
-  wireDropzone();
-  wireCounters();
-  wireTargetMode();
-  await refreshAccounts();
-  restoreLastRunConfig();
-  await refreshBrowserProfiles();
-  await initLoginSession();
-  await hydrateLastJob();
-  await refreshJobs();
-  $("#startBtn").addEventListener("click", startJob);
+    renderTransitionList();
+    wireDropzone();
+    wireCounters();
+    wireTargetMode();
+    await refreshAccounts();
+    restoreLastRunConfig();
+    await refreshBrowserProfiles();
+    await initLoginSession();
+    await hydrateLastJob();
+    await refreshJobs();
+    $("#startBtn").addEventListener("click", startJob);
+    $("#stitchTransitionReset")?.addEventListener("click", resetTransitionDefaults);
   $("#cancelBtn").addEventListener("click", cancelJob);
   $("#refreshJobsBtn")?.addEventListener("click", refreshJobs);
   $("#savePromptBtn")?.addEventListener("click", saveFixedPrompt);
