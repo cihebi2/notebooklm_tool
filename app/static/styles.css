@@ -734,6 +734,10 @@ a.btn{text-decoration:none}
   background: rgba(255,255,255,.12);
   color: rgba(255,255,255,.95);
 }
+.transitionDrop.disabled{
+  border-style: solid;
+  opacity:.7;
+}
 .transitionDrop.loading{
   cursor:wait;
   opacity:.8;

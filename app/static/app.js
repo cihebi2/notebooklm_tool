@@ -29,6 +29,7 @@ const STORAGE_SPLIT_PARTS = "notebooklm.splitPartPrompts";
 const STORAGE_SPLIT_CANDIDATES = "notebooklm.splitCandidatesPerPart";
 const STORAGE_STITCH_TRANSITIONS = "notebooklm.stitchTransitions";
 const STORAGE_STITCH_TRANSITION_REPEATS = "notebooklm.stitchTransitionRepeats";
+const STORAGE_STITCH_TRANSITION_LOCK = "notebooklm.stitchTransitionLock";
 const STORAGE_LAST_RUN_CONFIG = "notebooklm.lastRunConfig";
 const STALL_WARNING_MS = 20 * 60 * 1000;
 const DEFAULT_TRANSITIONS_BY_SEGMENTS = {
@@ -1522,6 +1523,16 @@ function _writeTransitionRepeats(list){
   }catch{}
 }
 
+function _readTransitionLock(){
+  return _readJSON(STORAGE_STITCH_TRANSITION_LOCK, null);
+}
+
+function _writeTransitionLock(value){
+  try{
+    localStorage.setItem(STORAGE_STITCH_TRANSITION_LOCK, JSON.stringify(!!value));
+  }catch{}
+}
+
 function _hasStoredTransitions(){
   try{
     return localStorage.getItem(STORAGE_STITCH_TRANSITIONS) !== null;
@@ -1533,6 +1544,14 @@ function _hasStoredTransitions(){
 function _hasStoredTransitionRepeats(){
   try{
     return localStorage.getItem(STORAGE_STITCH_TRANSITION_REPEATS) !== null;
+  }catch{
+    return false;
+  }
+}
+
+function _hasStoredTransitionLock(){
+  try{
+    return localStorage.getItem(STORAGE_STITCH_TRANSITION_LOCK) !== null;
   }catch{
     return false;
   }
@@ -1695,6 +1714,7 @@ function renderTransitionList(){
   const gaps = Math.max(0, segments - 1);
   let list = _normalizeTransitions(_readTransitions(), segments);
   let repeats = _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
+  let lock = _readTransitionLock();
 
   if (!_hasStoredTransitions()){
     const defaults = _defaultTransitions(segments);
@@ -1712,6 +1732,15 @@ function renderTransitionList(){
   }else{
     _writeTransitionRepeats(repeats);
   }
+
+  if (!_hasStoredTransitionLock()){
+    lock = true;
+    _writeTransitionLock(lock);
+  }
+  if (lock === null){
+    lock = true;
+  }
+  if ($("#stitchTransitionLock")) $("#stitchTransitionLock").checked = !!lock;
 
   box.innerHTML = "";
   if (gaps <= 0){
@@ -1736,7 +1765,7 @@ function renderTransitionList(){
 
     const label = document.createElement("div");
     label.className = "hint";
-    label.textContent = `第 ${i}-${i+1} 段过渡音频`;
+    label.textContent = `第 ${i}-${i+1} 段过渡音频（重复次数 0-5）`;
 
     const cell = document.createElement("div");
     cell.className = "transitionCell";
@@ -1819,6 +1848,14 @@ function renderTransitionList(){
       await handleFile(file);
     });
 
+    if (lock){
+      input.disabled = true;
+      repeat.disabled = true;
+      drop.classList.add("disabled");
+      drop.style.pointerEvents = "none";
+      drop.textContent = "已锁定";
+    }
+
     cell.append(input, repeat, drop, fileInput);
     row.append(label, cell);
     box.append(row);
@@ -1831,6 +1868,7 @@ function resetTransitionDefaults(){
   const repeats = _normalizeTransitionRepeats(_defaultTransitionRepeats(segments), segments);
   _writeTransitions(list);
   _writeTransitionRepeats(repeats);
+  _writeTransitionLock(true);
   renderTransitionList();
 }
 
@@ -3172,6 +3210,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     await refreshJobs();
     $("#startBtn").addEventListener("click", startJob);
     $("#stitchTransitionReset")?.addEventListener("click", resetTransitionDefaults);
+    $("#stitchTransitionLock")?.addEventListener("change", () => {
+      _writeTransitionLock(!!$("#stitchTransitionLock")?.checked);
+      renderTransitionList();
+    });
   $("#cancelBtn").addEventListener("click", cancelJob);
   $("#refreshJobsBtn")?.addEventListener("click", refreshJobs);
   $("#savePromptBtn")?.addEventListener("click", saveFixedPrompt);
