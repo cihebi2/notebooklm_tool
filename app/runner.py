@@ -4,7 +4,7 @@ import asyncio
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -502,7 +502,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                     "or lowering min_duration_minutes"
                 )
 
-            date_tag = datetime.now().strftime("%Y%m%d")
+            date_tag = (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
             final_name = f"{date_tag}-{math.floor(merged_minutes):02d}min_{job.id}_{ts}.{output_format}"
             final_path = job.outputs_dir / final_name
             result.output_path.replace(final_path)
@@ -2158,7 +2158,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 pass
                             return
 
-                        date_tag = datetime.now().strftime("%Y%m%d")
+                        date_tag = (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
                         final_name = (
                             f"{date_tag}-{math.floor(merged_minutes):02d}min_"
                             f"{_sanitize_filename(account.name)}_{job.id}_{ts}.{output_format}"
