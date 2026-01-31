@@ -30,6 +30,12 @@ const STORAGE_SPLIT_CANDIDATES = "notebooklm.splitCandidatesPerPart";
 const STORAGE_STITCH_TRANSITIONS = "notebooklm.stitchTransitions";
 const STORAGE_LAST_RUN_CONFIG = "notebooklm.lastRunConfig";
 const STALL_WARNING_MS = 20 * 60 * 1000;
+const DEFAULT_TRANSITIONS_BY_SEGMENTS = {
+  3: [
+    "assets/transitions/第一二段之间的链接-轻快活泼自由自在尤克里里.wav",
+    "assets/transitions/第二三段之间的连接-欢快轻快节奏活力阳光.wav",
+  ],
+};
 
 function persistLastJobId(jobId){
   try{
@@ -1501,6 +1507,19 @@ function _writeTransitions(list){
   }catch{}
 }
 
+function _hasStoredTransitions(){
+  try{
+    return localStorage.getItem(STORAGE_STITCH_TRANSITIONS) !== null;
+  }catch{
+    return false;
+  }
+}
+
+function _defaultTransitions(segments){
+  const key = Number(segments) || 0;
+  return (DEFAULT_TRANSITIONS_BY_SEGMENTS[key] || []).slice();
+}
+
 function _getSplitSegments(){
   const n = parseInt($("#splitSegments")?.value || "3", 10);
   return Number.isFinite(n) && n > 0 ? n : 3;
@@ -1633,8 +1652,19 @@ function renderTransitionList(){
   if (!box) return;
   const segments = _getSplitSegments();
   const gaps = Math.max(0, segments - 1);
-  const list = _normalizeTransitions(_readTransitions(), segments);
-  _writeTransitions(list);
+  let list = _normalizeTransitions(_readTransitions(), segments);
+
+  if (!_hasStoredTransitions()){
+    const defaults = _defaultTransitions(segments);
+    if (defaults.length){
+      list = _normalizeTransitions(defaults, segments);
+      _writeTransitions(list);
+    }else{
+      _writeTransitions(list);
+    }
+  }else{
+    _writeTransitions(list);
+  }
 
   box.innerHTML = "";
   if (gaps <= 0){
@@ -1642,18 +1672,32 @@ function renderTransitionList(){
     return;
   }
 
+  const uploadTransitionFile = async (file) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/api/transitions/upload", { method: "POST", body: form });
+    if (!res.ok){
+      throw new Error(await res.text());
+    }
+    const data = await res.json();
+    return String(data?.path || "");
+  };
+
   for (let i=1;i<=gaps;i++){
     const row = document.createElement("div");
     row.className = "transitionRow";
 
     const label = document.createElement("div");
     label.className = "hint";
-    label.textContent = `第 ${i}-${i+1} 段过渡音频路径`;
+    label.textContent = `第 ${i}-${i+1} 段过渡音频`;
+
+    const cell = document.createElement("div");
+    cell.className = "transitionCell";
 
     const input = document.createElement("input");
     input.type = "text";
     input.className = "transitionInput";
-    input.placeholder = "例如 C:\\path\\to\\transition.wav";
+    input.placeholder = "可选：填写本地路径，或拖拽音频文件到右侧";
     input.value = list[i - 1] || "";
     input.addEventListener("input", () => {
       const next = _normalizeTransitions(_readTransitions(), segments);
@@ -1661,7 +1705,61 @@ function renderTransitionList(){
       _writeTransitions(next);
     });
 
-    row.append(label, input);
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = "audio/*";
+    fileInput.className = "transitionFileInput";
+
+    const drop = document.createElement("div");
+    drop.className = "transitionDrop";
+    drop.textContent = "拖拽或点击选择";
+
+    const applyUploadedPath = (path) => {
+      if (!path) return;
+      input.value = path;
+      const next = _normalizeTransitions(_readTransitions(), segments);
+      next[i - 1] = String(path);
+      _writeTransitions(next);
+    };
+
+    const handleFile = async (file) => {
+      if (!file) return;
+      drop.classList.add("loading");
+      drop.textContent = "上传中…";
+      try{
+        const path = await uploadTransitionFile(file);
+        applyUploadedPath(path);
+      }catch(e){
+        alert(`过渡音频上传失败：${String(e)}`);
+      }finally{
+        drop.classList.remove("loading");
+        drop.textContent = "拖拽或点击选择";
+      }
+    };
+
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files?.[0];
+      await handleFile(file);
+      fileInput.value = "";
+    });
+
+    drop.addEventListener("click", () => fileInput.click());
+    drop.addEventListener("dragover", (ev) => {
+      ev.preventDefault();
+      drop.classList.add("drag");
+    });
+    drop.addEventListener("dragleave", () => {
+      drop.classList.remove("drag");
+    });
+    drop.addEventListener("drop", async (ev) => {
+      ev.preventDefault();
+      drop.classList.remove("drag");
+      const file = ev.dataTransfer?.files?.[0];
+      await handleFile(file);
+    });
+
+    cell.append(input, drop, fileInput);
+    row.append(label, cell);
     box.append(row);
   }
 }

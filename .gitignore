@@ -8,3 +8,6 @@ outputs/
 *.mp4
 *.m4a
 *.wav
+!assets/
+!assets/**
+!assets/transitions/*.wav

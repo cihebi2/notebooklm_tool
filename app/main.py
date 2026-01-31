@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ accounts_store = AccountsStore(paths)
 job_manager = JobManager(paths, accounts_store)
 login_manager = LoginSessionManager(paths.data_dir / "login_sessions")
 prompts_path = paths.data_dir / "prompts.json"
+default_prompts_path = paths.base_dir / "assets" / "prompts.default.json"
 
 app = FastAPI(title="Podcast Studio (NotebookLM)")
 
@@ -38,7 +40,16 @@ def _now_iso() -> str:
 
 def _read_prompts() -> dict[str, Any]:
     if not prompts_path.exists():
-        return {}
+        if default_prompts_path.exists():
+            try:
+                prompts_path.write_text(
+                    default_prompts_path.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        else:
+            return {}
     try:
         return json.loads(prompts_path.read_text(encoding="utf-8"))
     except Exception:
@@ -47,6 +58,12 @@ def _read_prompts() -> dict[str, Any]:
 
 def _write_prompts(data: dict[str, Any]) -> None:
     prompts_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _sanitize_filename(name: str) -> str:
+    name = Path(name).name
+    safe = re.sub(r"[\\/:*?\"<>|]+", "_", name).strip()
+    return safe or "transition_audio"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -187,6 +204,38 @@ async def save_split_prompts(req: SaveSplitPromptRequest) -> dict[str, Any]:
     data["split"] = split
     _write_prompts(data)
     return split
+
+
+@app.post("/api/transitions/upload")
+async def upload_transition_audio(file: UploadFile = File(...)) -> dict[str, Any]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="file is missing")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="file is empty")
+
+    transitions_dir = paths.data_dir / "transitions"
+    transitions_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = _sanitize_filename(file.filename)
+    if not safe_name.lower().endswith((".wav", ".mp3", ".m4a", ".mp4", ".aac", ".flac")):
+        # keep original extension if any, otherwise default to .wav
+        ext = Path(file.filename).suffix
+        safe_name = safe_name + (ext if ext else ".wav")
+
+    dest = transitions_dir / safe_name
+    if dest.exists():
+        stem = dest.stem
+        suffix = dest.suffix
+        for i in range(2, 1000):
+            candidate = transitions_dir / f"{stem}_{i}{suffix}"
+            if not candidate.exists():
+                dest = candidate
+                break
+
+    dest.write_bytes(raw)
+    rel = dest.relative_to(paths.base_dir)
+    return {"ok": True, "path": str(rel)}
 
 
 @app.post("/api/accounts/import/profile")
