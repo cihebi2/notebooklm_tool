@@ -114,6 +114,7 @@ function collectLastRunConfig(){
     split_parallel_ui: !!$("#splitParallel")?.checked,
     split_segments: segs,
     split_min_duration_minutes: parseFloat($("#splitMinMinutes")?.value || "15"),
+    split_task_timeout_minutes: parseFloat($("#splitTaskTimeout")?.value || "40"),
     split_output_format: $("#splitOutputFormat")?.value || "m4a",
     split_keep_parts: !!$("#splitKeepParts")?.checked,
     split_manual_stitch: !!$("#splitManualStitch")?.checked,
@@ -154,6 +155,7 @@ function restoreLastRunConfig(){
     if ($("#splitParallel")) $("#splitParallel").checked = (cfg.split_parallel_ui != null) ? !!cfg.split_parallel_ui : !!cfg.split_parallel;
     if ($("#splitSegments") && cfg.split_segments != null) $("#splitSegments").value = String(cfg.split_segments);
     if ($("#splitMinMinutes") && cfg.split_min_duration_minutes != null) $("#splitMinMinutes").value = String(cfg.split_min_duration_minutes);
+    if ($("#splitTaskTimeout") && cfg.split_task_timeout_minutes != null) $("#splitTaskTimeout").value = String(cfg.split_task_timeout_minutes);
     if ($("#splitOutputFormat") && cfg.split_output_format) $("#splitOutputFormat").value = String(cfg.split_output_format);
     if ($("#splitKeepParts")) $("#splitKeepParts").checked = !!cfg.split_keep_parts;
     if ($("#splitManualStitch")) $("#splitManualStitch").checked = !!cfg.split_manual_stitch;
@@ -407,6 +409,8 @@ function lineText(ev){
     case "split_waiting_selection": return `等待手动选择拼接文件（第 ${ev.episode || 1} 期）`;
     case "split_stitch_selection_submitted": return `已提交拼接选择（第 ${ev.episode || 1} 期）`;
     case "split_stitch_selection_received": return `已收到拼接选择，开始拼接…（第 ${ev.episode || 1} 期）`;
+    case "split_stop_requested": return `已请求停止生成，准备拼接当前候选（模式 ${ev.mode || "auto"}）`;
+    case "split_stop_auto_stitch": return `停止后自动拼接当前候选`;
     case "part_attempt_error": return `${a} 第 ${ev.part} 段尝试出错: ${ev.error || ""}${errSuffix(ev)}`;
     case "downloaded": {
       const mode = String(ev.target_mode || "");
@@ -472,6 +476,7 @@ function setJobStats(job){
 
   renderProgressSummary(job);
   renderProgressWarning();
+  updateStopAndStitchBtn();
 }
 
 function _accountDisplayName(accountId, fallback){
@@ -631,6 +636,30 @@ function renderProgressWarning(){
   warn.style.display = "block";
 }
 
+function canStopAndStitch(){
+  const job = state.job;
+  if (!job) return false;
+  if (!job.config?.split_enabled) return false;
+  if (!["running","queued"].includes(String(job.state || ""))) return false;
+  const parts = state.parts || {};
+  let enabled = 0;
+  for (const key of Object.keys(parts)){
+    const p = parts[key];
+    const req = Number(p?.required ?? 1);
+    if (req <= 0) continue;
+    enabled += 1;
+    const accepted = Number(p?.accepted ?? 0);
+    if (!Number.isFinite(accepted) || accepted < 1) return false;
+  }
+  return enabled > 0;
+}
+
+function updateStopAndStitchBtn(){
+  const btn = $("#stopAndStitchBtn");
+  if (!btn) return;
+  btn.disabled = !canStopAndStitch();
+}
+
 function renderInflight(){
   const box = $("#inflight");
   if (!box) return;
@@ -719,6 +748,7 @@ function renderSplitBoard(){
     card.append(top, meta);
     box.append(card);
   }
+  updateStopAndStitchBtn();
 }
 
 function _ensureSplitParts(segments){
@@ -852,6 +882,7 @@ function updateDerivedFromEvent(ev, opts={}){
     renderSplitBoard();
     renderProgressWarning();
     renderStitchPanel?.();
+    updateStopAndStitchBtn();
   }
 }
 
@@ -1266,6 +1297,7 @@ async function loadJob(jobId, opts={}){
     const running = (job?.state === "running" || job?.state === "queued" || job?.state === "waiting_selection");
     $("#startBtn").disabled = running;
     $("#cancelBtn").disabled = !running;
+    updateStopAndStitchBtn();
     if (running){
       connectSSE(id);
     }
@@ -2919,6 +2951,7 @@ function collectConfig(){
     split_parallel: ($("#splitEnabled").checked && $("#splitParallel").checked),
     split_segments: parseInt($("#splitSegments").value || "3",10),
     split_min_duration_minutes: parseFloat($("#splitMinMinutes").value || "15"),
+    split_task_timeout_minutes: parseFloat($("#splitTaskTimeout")?.value || "40"),
     split_output_format: $("#splitOutputFormat").value,
     split_keep_parts: $("#splitKeepParts").checked,
     split_manual_stitch: ($("#splitEnabled").checked && $("#splitManualStitch").checked),
@@ -3026,6 +3059,35 @@ async function cancelJob(){
   const job = state.job;
   if (!job?.id) return;
   await fetch(`/api/jobs/${job.id}/cancel`, {method:"POST"});
+}
+
+async function stopAndStitch(){
+  const job = state.job;
+  if (!job?.id) return;
+  const btn = $("#stopAndStitchBtn");
+  if (btn){
+    btn.disabled = true;
+    btn.textContent = "提交中…";
+  }
+  try{
+    const res = await fetch(`/api/jobs/${job.id}/stop-and-stitch`, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({mode:"auto"}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok){
+      throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    }
+    alert("已请求停止生成，准备拼接当前候选音频");
+  }catch(e){
+    alert(`停止并拼接失败：${String(e)}`);
+  }finally{
+    if (btn){
+      btn.textContent = "停止并拼接";
+      updateStopAndStitchBtn();
+    }
+  }
 }
 
 function connectSSE(jobId){
@@ -3316,6 +3378,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       renderTransitionList();
     });
   $("#cancelBtn").addEventListener("click", cancelJob);
+  $("#stopAndStitchBtn")?.addEventListener("click", stopAndStitch);
   $("#refreshJobsBtn")?.addEventListener("click", refreshJobs);
   $("#savePromptBtn")?.addEventListener("click", saveFixedPrompt);
   $("#loadPromptBtn")?.addEventListener("click", () => loadFixedPrompt({fallbackToDefault:false}));

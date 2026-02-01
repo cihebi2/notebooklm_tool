@@ -31,6 +31,7 @@ class JobConfig(BaseModel):
     split_parallel: bool = True
     split_segments: int = Field(ge=2, le=10, default=3)
     split_min_duration_minutes: float = Field(ge=1, le=120, default=15.0)
+    split_task_timeout_minutes: float = Field(ge=5, le=240, default=40.0)
     split_output_format: str = Field(default="m4a")  # mp3 | mp4 | m4a
     split_keep_parts: bool = True
     split_manual_stitch: bool = False
@@ -173,6 +174,8 @@ class Job:
     _stitch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _stitch_futures: dict[int, asyncio.Future[dict[int, str]]] = field(default_factory=dict, repr=False)
     _stitch_pending: dict[int, dict[int, str]] = field(default_factory=dict, repr=False)
+    _stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _stop_mode: str | None = field(default=None, repr=False)
 
     @property
     def job_dir(self) -> Path:
@@ -216,6 +219,8 @@ class Job:
             "successes": self.successes,
             "downloads": self.downloads,
             "files": self.list_files(),
+            "stop_requested": self._stop_event.is_set(),
+            "stop_mode": self._stop_mode,
         }
 
     def list_files(self) -> list[dict[str, Any]]:
@@ -375,6 +380,21 @@ class Job:
     @property
     def is_cancelled(self) -> bool:
         return self._cancel_event.is_set()
+
+    def request_stop(self, mode: str | None = None) -> None:
+        mode_norm = str(mode or "auto").strip().lower()
+        if mode_norm not in {"auto", "manual"}:
+            mode_norm = "auto"
+        self._stop_mode = mode_norm
+        self._stop_event.set()
+
+    @property
+    def is_stop_requested(self) -> bool:
+        return self._stop_event.is_set()
+
+    @property
+    def stop_mode(self) -> str:
+        return (self._stop_mode or "auto").strip().lower()
 
 
 class JobManager:

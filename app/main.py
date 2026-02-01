@@ -366,9 +366,67 @@ async def cancel_job(job_id: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.post("/api/jobs/{job_id}/stop-and-stitch")
+async def stop_and_stitch(job_id: str, req: StopAndStitchRequest) -> dict[str, Any]:
+    job = job_manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.state not in {"running", "queued", "waiting_selection"}:
+        raise HTTPException(status_code=400, detail="job is not running")
+    if not bool(getattr(job.config, "split_enabled", False)):
+        raise HTTPException(status_code=400, detail="job is not split_enabled")
+
+    segments = int(getattr(job.config, "split_segments", 3) or 3)
+    raw_candidates = getattr(job.config, "split_candidates_per_part", []) or []
+    enabled_parts = set()
+    for i in range(max(1, segments)):
+        try:
+            n = int(raw_candidates[i]) if i < len(raw_candidates) else 1
+        except Exception:
+            n = 1
+        if n > 0:
+            enabled_parts.add(i + 1)
+    if not enabled_parts:
+        raise HTTPException(status_code=400, detail="all parts are disabled (candidates_per_part are 0)")
+
+    accepted_parts: set[int] = set()
+    for ev in reversed(job.event_log):
+        if not isinstance(ev, dict):
+            continue
+        if str(ev.get("type") or "") != "part_accepted":
+            continue
+        try:
+            part_idx = int(ev.get("part") or 0)
+        except Exception:
+            part_idx = 0
+        if part_idx in enabled_parts:
+            accepted_parts.add(part_idx)
+            if accepted_parts == enabled_parts:
+                break
+    missing = sorted(enabled_parts - accepted_parts)
+    if missing:
+        raise HTTPException(status_code=409, detail=f"missing accepted parts: {missing}")
+
+    job.request_stop(req.mode)
+    await job.publish(
+        {
+            "type": "split_stop_requested",
+            "ts": _now_iso(),
+            "job_id": job.id,
+            "mode": job.stop_mode,
+            "parts": sorted(enabled_parts),
+        }
+    )
+    return {"ok": True, "mode": job.stop_mode}
+
+
 class StitchRequest(BaseModel):
     episode: int = 1
     parts: dict[str, str] = Field(default_factory=dict)
+
+
+class StopAndStitchRequest(BaseModel):
+    mode: str | None = None  # auto | manual
 
 
 class ConcatImportRequest(BaseModel):

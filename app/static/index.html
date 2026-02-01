@@ -85,6 +85,7 @@
             <div class="btnRow" style="margin-top:12px">
               <button id="startBtn" class="btn primary">启动生成</button>
               <button id="cancelBtn" class="btn danger">取消</button>
+              <button id="stopAndStitchBtn" class="btn">停止并拼接</button>
               <button id="saveConfigBtn" class="btn">保存当前配置</button>
               <a class="btn ghost" href="/concat" target="_blank">音频拼接工作台</a>
             </div>
@@ -269,6 +270,10 @@
               <div class="field">
                 <label>每段阈值（分钟）</label>
                 <input id="splitMinMinutes" type="number" min="1" max="120" value="15" />
+              </div>
+              <div class="field">
+                <label>单段超时（分钟）</label>
+                <input id="splitTaskTimeout" type="number" min="5" max="240" value="40" />
               </div>
               <div class="field">
                 <label>Split Parallel</label>

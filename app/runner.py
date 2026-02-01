@@ -204,7 +204,8 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
     split_output_format = str(getattr(cfg, "split_output_format", "m4a") or "m4a").strip().lower()
     split_keep_parts = bool(getattr(cfg, "split_keep_parts", True))
     split_manual_stitch = bool(getattr(cfg, "split_manual_stitch", False))
-    split_task_timeout = max(1200.0, min(3600.0, split_min_seconds * 2.0))
+    split_task_timeout_minutes = float(getattr(cfg, "split_task_timeout_minutes", 40.0))
+    split_task_timeout = max(300.0, min(7200.0, split_task_timeout_minutes * 60.0))
     transition_enabled = bool(getattr(cfg, "stitch_transition_enabled", False))
     transition_fade_seconds = float(getattr(cfg, "stitch_transition_fade_seconds", 3.0))
     transition_files = list(getattr(cfg, "stitch_transition_files", []) or [])
@@ -531,11 +532,11 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             accounts_semaphore = asyncio.Semaphore(cfg.accounts_concurrency)
 
             async def account_worker(account: Any, max_attempts: int) -> None:
-                if done_event.is_set() or failed_event.is_set() or job.is_cancelled:
+                if done_event.is_set() or failed_event.is_set() or job.is_cancelled or job.is_stop_requested:
                     return
 
                 async with accounts_semaphore:
-                    if done_event.is_set() or failed_event.is_set() or job.is_cancelled:
+                    if done_event.is_set() or failed_event.is_set() or job.is_cancelled or job.is_stop_requested:
                         return
 
                     await publish(
@@ -610,7 +611,12 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
 
                             source_cache: dict[int, tuple[Any, str]] = {}
 
-                            while not job.is_cancelled and not done_event.is_set() and not failed_event.is_set():
+                            while (
+                                not job.is_cancelled
+                                and not job.is_stop_requested
+                                and not done_event.is_set()
+                                and not failed_event.is_set()
+                            ):
                                 try:
                                     part_index = await asyncio.wait_for(part_queue.get(), timeout=1.0)
                                 except asyncio.TimeoutError:
@@ -908,9 +914,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                             raise
                                         except TimeoutError as e:
                                             poll_timeout = _is_poll_studio_timeout(e)
-                                            err_msg = str(e)
-                                            if poll_timeout:
-                                                err_msg = f"{err_msg} (switch account)"
+                                            err_msg = f"{str(e)} (switch account)"
                                             await publish(
                                                 {
                                                     "type": "part_attempt_error",
@@ -932,15 +936,15 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                 except Exception:
                                                     pass
                                             await asyncio.sleep(2.0)
-                                            if poll_timeout:
-                                                return {
-                                                    "ok": False,
-                                                    "fatal_for_account": True,
-                                                    "reason": "POLL_STUDIO_TIMEOUT",
-                                                    "attempt": attempt,
-                                                    "task_id": task_id,
-                                                }
-                                            return None
+                                            return {
+                                                "ok": False,
+                                                "fatal_for_account": True,
+                                                "reason": "POLL_STUDIO_TIMEOUT"
+                                                if poll_timeout
+                                                else "TASK_TIMEOUT",
+                                                "attempt": attempt,
+                                                "task_id": task_id,
+                                            }
                                         except RPCError as e:
                                             await publish(
                                                 {
@@ -980,12 +984,16 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
 
                                     try:
                                         while accepted_outcome is None and not (
-                                            job.is_cancelled or done_event.is_set() or failed_event.is_set()
+                                            job.is_cancelled
+                                            or job.is_stop_requested
+                                            or done_event.is_set()
+                                            or failed_event.is_set()
                                         ) and not switch_account:
                                             while (
                                                 next_attempt <= max_attempts
                                                 and len(active) < per_account_concurrency
                                                 and not switch_account
+                                                and not job.is_stop_requested
                                             ):
                                                 attempt_no = next_attempt
                                                 next_attempt += 1
@@ -1218,7 +1226,12 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             tasks = [asyncio.create_task(account_worker(acc, ma)) for acc, ma in account_plans]
 
             try:
-                while not done_event.is_set() and not failed_event.is_set() and not job.is_cancelled:
+                while (
+                    not done_event.is_set()
+                    and not failed_event.is_set()
+                    and not job.is_cancelled
+                    and not job.is_stop_requested
+                ):
                     await asyncio.sleep(0.25)
             finally:
                 try:
@@ -1242,7 +1255,12 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                 best = max(cands, key=lambda c: float(c.get("duration_minutes") or 0.0))
                 return str(best.get("file") or "")
 
-            if split_manual_stitch:
+            stop_requested = job.is_stop_requested
+            stop_mode = job.stop_mode if stop_requested else "auto"
+            force_manual = stop_requested and stop_mode == "manual"
+            manual_mode = force_manual or (split_manual_stitch and not stop_requested)
+
+            if manual_mode:
                 job.state = "waiting_selection"
                 public_candidates: dict[int, list[dict[str, Any]]] = {}
                 for idx in sorted(parts_by_index):
@@ -1293,6 +1311,14 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                     }
                 )
             else:
+                if stop_requested:
+                    await publish(
+                        {
+                            "type": "split_stop_auto_stitch",
+                            "ts": _now_iso(),
+                            "episode": episode_index,
+                        }
+                    )
                 selection = {idx: _pick_default(idx) for idx in enabled_parts}
 
             expected = set(enabled_parts)
@@ -1844,6 +1870,8 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 while True:
                                     if job.is_cancelled:
                                         return
+                                    if job.is_stop_requested:
+                                        break
                                     async with success_lock:
                                         if job.successes >= target:
                                             return
@@ -1852,6 +1880,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                         next_attempt <= max_attempts
                                         and len(active) < per_account_concurrency
                                         and len(candidates_by_part.get(part.index, [])) < part_required
+                                        and not job.is_stop_requested
                                     ):
                                         attempt_no = next_attempt
                                         next_attempt += 1
@@ -1959,7 +1988,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     ]
                                     await asyncio.gather(*deletes, return_exceptions=True)
 
-                            if len(candidates_by_part.get(part.index, [])) < part_required:
+                            if not job.is_stop_requested and len(candidates_by_part.get(part.index, [])) < part_required:
                                 await publish(
                                     {
                                         "type": "split_failed",
@@ -1982,8 +2011,13 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                             best = max(cands, key=lambda c: float(c.get("duration_minutes") or 0.0))
                             return str(best.get("file") or "")
 
+                        stop_requested = job.is_stop_requested
+                        stop_mode = job.stop_mode if stop_requested else "auto"
+                        force_manual = stop_requested and stop_mode == "manual"
+                        manual_mode = force_manual or (split_manual_stitch and not stop_requested)
+
                         selection: dict[int, str] = {}
-                        if split_manual_stitch:
+                        if manual_mode:
                             job.state = "waiting_selection"
                             public_candidates: dict[int, list[dict[str, Any]]] = {}
                             for idx in sorted(required_by_part):
@@ -2039,6 +2073,14 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 }
                             )
                         else:
+                            if stop_requested:
+                                await publish(
+                                    {
+                                        "type": "split_stop_auto_stitch",
+                                        "ts": _now_iso(),
+                                        "episode": episode_index,
+                                    }
+                                )
                             selection = {idx: _pick_default(idx) for idx in enabled_parts}
 
                         expected = set(enabled_parts)
