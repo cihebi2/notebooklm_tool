@@ -13,6 +13,9 @@
 - 设置：目标音频条数、语言、长度（LONG/DEFAULT/SHORT）、风格、提示词
 - 后台自动轮询生成 → 下载 → 读取音频时长 → 达标即保留
 - 页面实时显示日志与下载列表
+- 分段音频可插入「过渡音频」（可设置淡入淡出、重复次数、时长）
+- 内置独立的拼接页面 `/concat`，支持片头/片尾/片尾曲拼接
+- 主页面「一键导入拼接」：把生成的音频直接送到拼接页并自动开始
 
 ## 安装 & 运行（Windows / PowerShell）
 
@@ -60,3 +63,47 @@ python -m venv .venv
 ## 分段拼接
 
 开启「分段拼接」后，服务会用 `ffmpeg` 把多段音频拼成一个文件（因此需要 `ffmpeg` 在 PATH 里）。
+
+## 拼接页面 / 过渡音频
+
+- 拼接页地址：`http://127.0.0.1:8000/concat`
+- 支持片头 / 片尾 / 片尾音乐拼接，可设置重复次数与质量
+- 主页面的「一键导入拼接」会自动把音频填入拼接页并开始处理
+- 分段拼接的“过渡音频”支持：
+  - 自定义路径或拖拽上传
+  - 设置“重复次数”“目标时长（秒）”“淡入淡出时长”
+  - 目标时长超过原音频会自动循环
+
+## 另一台电脑部署 & 更新
+
+### 首次部署
+
+```powershell
+git clone git@github.com:cihebi2/notebooklm_tool.git notebooklm_tool
+cd notebooklm_tool
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+.\.venv\Scripts\uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+打开：`http://127.0.0.1:8000`
+
+### 更新到最新版本
+
+```powershell
+cd notebooklm_tool
+git pull
+.\.venv\Scripts\pip install -r requirements.txt
+```
+
+如有运行中的服务，请先停止再启动（`run.bat` 或上面 uvicorn 命令）。
+
+### 迁移已有账号/提示词/自定义音频
+
+如果你在旧机器上已有账号与自定义音频，请拷贝以下目录到新机器同路径：
+
+- 账号与任务数据：`data/`
+- 过渡音频上传：`data/transitions/`
+- 拼接固定音频（片头/片尾/片尾曲）：`assets/concat_fixed/`
+
+> 提示：网页上的“上次运行配置”存于浏览器本地缓存（localStorage），不会自动跨机器同步。
