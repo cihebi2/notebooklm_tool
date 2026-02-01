@@ -1,4 +1,4 @@
-﻿const dropSingle = document.getElementById('dropSingle');
+const dropSingle = document.getElementById('dropSingle');
 const dropMulti = document.getElementById('dropMulti');
 const fileSingleInput = document.getElementById('fileSingle');
 const fileMultiInput = document.getElementById('fileMulti');
@@ -100,6 +100,197 @@ function resetResult(){
   lastOutputFile = null;
   openBtn.disabled = true;
   resetProgress();
+}
+
+const stageMap = {
+  analyzing: '分析主音频',
+  preparing_fixed: '准备固定片头/片尾',
+  transcoding_main: '转码主音频',
+  combining_main: '合并主音频',
+  concatenating: '拼接输出',
+  finalizing: '读取结果信息',
+  done: '完成',
+  error: '失败',
+};
+
+function startWatchingJob(data){
+  if (!data) return;
+  if (currentEventSource) {
+    try { currentEventSource.close(); } catch(_){}
+    currentEventSource = null;
+  }
+
+  lastOutputFile = data.outputFile || lastOutputFile;
+  buildBtn.disabled = true;
+  setProgress(15, '上传完成，等待处理…');
+  setStatus('上传完成，开始处理…');
+
+  const eventsUrl = data.eventsUrl || `/concat/api/jobs/${encodeURIComponent(data.jobId || '')}/events`;
+  if (!eventsUrl) {
+    setStatus('无法订阅任务事件');
+    buildBtn.disabled = false;
+    return;
+  }
+
+  const es = new EventSource(eventsUrl);
+  currentEventSource = es;
+
+  let transcodePct = 0;
+  const sec = (ms) => (ms/1000).toFixed(2) + 's';
+
+  const setStageProgress = (stage, message) => {
+    const label = stageMap[stage] || stage;
+    setStatus(message || label);
+
+    if (stage === 'analyzing') setProgress(16, message || '分析主音频…');
+    else if (stage === 'preparing_fixed') setProgress(18, message || '准备固定音频…');
+    else if (stage === 'transcoding_main') setProgress(20, message || '转码主音频…');
+    else if (stage === 'combining_main') setProgress(95, message || '合并主音频…');
+    else if (stage === 'concatenating') setProgress(96, message || '拼接输出…');
+    else if (stage === 'finalizing') setProgress(98, message || '读取结果信息…');
+  };
+
+  es.addEventListener('stage', (e) => {
+    try {
+      const payload = JSON.parse(e.data);
+      setStageProgress(payload.stage, payload.message);
+    } catch(_) {}
+  });
+
+  es.addEventListener('progress', (e) => {
+    try {
+      const payload = JSON.parse(e.data);
+      if (payload.stage !== 'transcoding_main') return;
+      transcodePct = Math.max(0, Math.min(Number(payload.pct || 0), 1));
+      const overall = 20 + transcodePct * 75;
+      const pctText = (transcodePct * 100).toFixed(1) + '%';
+      const extra = [];
+      if (payload.part && payload.parts) extra.push(`${payload.part}/${payload.parts}`);
+      if (payload.speed) extra.push(payload.speed);
+      const extraText = extra.length ? `（${extra.join('，')}）` : '';
+      setProgress(overall, `主音频 ${pctText}${extraText}`);
+    } catch(_) {}
+  });
+
+  es.addEventListener('done', (e) => {
+    try {
+      const payload = JSON.parse(e.data);
+      lastOutputFile = payload.outputFile || lastOutputFile;
+      openBtn.disabled = false;
+      setProgress(100, '完成 100%');
+      setStatus(`完成，总耗时 ${sec(payload.elapsedMs)}`);
+      const durationSeconds = Number(payload.durationSeconds);
+      const durationInt = Number.isFinite(durationSeconds) ? Math.round(durationSeconds) : null;
+      const durationText = durationInt === null ? '未知' : `${durationInt}s`;
+      resultEl.innerHTML = '';
+      if (lastOutputFile) {
+        const nameLine = document.createElement('div');
+        nameLine.className = 'result-line';
+        const meta = durationText ? ` · ${durationText}` : '';
+        nameLine.textContent = `输出：${lastOutputFile}${meta}`;
+        const dl = document.createElement('a');
+        dl.className = 'btn';
+        dl.textContent = '下载';
+        dl.target = '_blank';
+        dl.href = payload.downloadUrl || `/concat/download/${encodeURIComponent(lastOutputFile)}`;
+        resultEl.append(nameLine, dl);
+      }
+    } catch (err) {
+      setStatus('完成');
+      setProgress(100, '完成 100%');
+    } finally {
+      try { es.close(); } catch(_){}
+      if (currentEventSource === es) currentEventSource = null;
+      buildBtn.disabled = false;
+    }
+  });
+
+  es.addEventListener('job_error', (e) => {
+    try {
+      const payload = JSON.parse(e.data);
+      setStatus('失败：' + (payload.message || '处理失败'));
+    } catch(_) {
+      setStatus('失败：处理失败');
+    }
+    setProgress(0, '处理失败');
+    try { es.close(); } catch(_){}
+    if (currentEventSource === es) currentEventSource = null;
+    buildBtn.disabled = false;
+  });
+}
+
+async function loadJobFromUrl(){
+  const params = new URLSearchParams(location.search);
+  const jobId = params.get('job');
+  if (!jobId) return false;
+  resetResult();
+  setStatus('已导入任务，加载中…');
+  try{
+    const r = await fetch(`/concat/api/jobs/${encodeURIComponent(jobId)}`);
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok){
+      throw new Error(data?.detail || data?.error || `HTTP ${r.status}`);
+    }
+    startWatchingJob({
+      ...data,
+      eventsUrl: `/concat/api/jobs/${encodeURIComponent(jobId)}/events`,
+    });
+    return true;
+  }catch(e){
+    setStatus(`导入失败：${String(e)}`);
+    buildBtn.disabled = false;
+    return false;
+  }
+}
+
+async function importFromUrl(){
+  const params = new URLSearchParams(location.search);
+  const jobId = params.get('import_job') || params.get('importJob') || params.get('import');
+  const file = params.get('file');
+  if (!jobId || !file) return false;
+
+  resetResult();
+  setStatus('已导入文件，开始拼接…');
+
+  if (pickedSingleEl){
+    pickedSingleEl.textContent = file;
+    pickedSingleEl.classList.remove('muted');
+  }
+  if (pickedActiveEl){
+    pickedActiveEl.textContent = '单段主音频（导入）';
+    pickedActiveEl.classList.remove('muted');
+  }
+
+  const repeat = parseInt(repeatInput?.value || '3', 10);
+  const quality = parseInt(qualitySelect?.value || '5', 10);
+  if (outputNameInput){
+    const name = defaultOutputNameFromFileName(file);
+    suggestOutputName(name);
+  }
+
+  try{
+    const res = await fetch('/concat/api/import', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        job_id: jobId,
+        file,
+        repeat: Number.isFinite(repeat) ? repeat : 3,
+        quality: Number.isFinite(quality) ? quality : 5,
+        output_name: outputNameInput?.value || '',
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok){
+      throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    }
+    startWatchingJob(data);
+    return true;
+  }catch(e){
+    setStatus(`导入失败：${String(e)}`);
+    buildBtn.disabled = false;
+    return false;
+  }
 }
 
 function fileSort(a, b){
@@ -345,118 +536,7 @@ buildBtn.addEventListener('click', async () => {
       return;
     }
 
-    lastOutputFile = data.outputFile;
-    setProgress(15, '上传完成，等待处理…');
-    setStatus('上传完成，开始处理…');
-
-    const sec = (ms) => (ms/1000).toFixed(2) + 's';
-    const stageMap = {
-      analyzing: '分析音频',
-      preparing_fixed: '准备固定片头/片尾',
-      transcoding_main: '转码主音频',
-      combining_main: '合并主音频',
-      concatenating: '拼接输出',
-      finalizing: '读取结果信息',
-      done: '完成',
-      error: '失败',
-    };
-
-    const eventsUrl = data.eventsUrl;
-    const es = new EventSource(eventsUrl);
-    currentEventSource = es;
-
-    let transcodePct = 0;
-
-    const setStageProgress = (stage, message) => {
-      const label = stageMap[stage] || stage;
-      setStatus(message || label);
-
-      if (stage === 'analyzing') setProgress(16, message || '分析音频…');
-      else if (stage === 'preparing_fixed') setProgress(18, message || '准备固定音频…');
-      else if (stage === 'transcoding_main') setProgress(20, message || '转码主音频…');
-      else if (stage === 'combining_main') setProgress(95, message || '合并主音频…');
-      else if (stage === 'concatenating') setProgress(96, message || '拼接输出…');
-      else if (stage === 'finalizing') setProgress(98, message || '读取结果信息…');
-    };
-
-    es.addEventListener('stage', (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        setStageProgress(payload.stage, payload.message);
-      } catch(_) {}
-    });
-
-    es.addEventListener('progress', (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        if (payload.stage !== 'transcoding_main') return;
-        transcodePct = clamp(Number(payload.pct || 0), 0, 1);
-        const overall = 20 + transcodePct * 75;
-        const pctText = (transcodePct * 100).toFixed(1) + '%';
-        const extra = [];
-        if (payload.part && payload.parts) extra.push(`${payload.part}/${payload.parts}`);
-        if (payload.speed) extra.push(payload.speed);
-        const extraText = extra.length ? `（${extra.join('，')}）` : '';
-        setProgress(overall, `主音频 ${pctText}${extraText}`);
-      } catch(_) {}
-    });
-
-    es.addEventListener('done', (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        lastOutputFile = payload.outputFile;
-        openBtn.disabled = false;
-        setProgress(100, '完成 100%');
-        setStatus(`完成：总耗时 ${sec(payload.elapsedMs)}`);
-        const durationSeconds = Number(payload.durationSeconds);
-        const durationInt = Number.isFinite(durationSeconds) ? Math.round(durationSeconds) : null;
-        const durationText = durationInt === null ? '未知' : String(durationInt);
-        const latestTxt = payload.latestTxtPath ? String(payload.latestTxtPath) : '';
-        resultEl.innerHTML =
-          `<div>输出文件：<a href="${payload.downloadUrl}" download>${payload.outputFile}</a></div>` +
-          `<div>时长（秒）：<span id="durationValue">${durationText}</span> ` +
-            `<button id="copyDuration" class="secondary mini" type="button" ${durationInt === null ? 'disabled' : ''}>复制时长</button>` +
-          `</div>` +
-          `<div class="muted">保存位置：${payload.outputPath}</div>` +
-          (latestTxt ? `<div class="muted">写入 TXT：${latestTxt}</div>` : '');
-
-        const copyBtn = document.getElementById('copyDuration');
-        if (copyBtn && durationInt !== null) {
-          copyBtn.addEventListener('click', async () => {
-            const ok = await copyTextToClipboard(String(durationInt));
-            if (ok) {
-              const old = copyBtn.textContent;
-              copyBtn.textContent = '已复制';
-              setTimeout(() => { copyBtn.textContent = old || '复制时长'; }, 1200);
-            }
-          });
-        }
-      } catch (err) {
-        setStatus('完成');
-        setProgress(100, '完成 100%');
-      } finally {
-        try { es.close(); } catch(_){}
-        if (currentEventSource === es) currentEventSource = null;
-        buildBtn.disabled = false;
-      }
-    });
-
-    es.addEventListener('job_error', (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        setStatus('失败：' + (payload.message || '处理失败'));
-      } catch(_) {
-        setStatus('失败：处理失败');
-      }
-      setProgress(0, '处理失败');
-      try { es.close(); } catch(_){}
-      if (currentEventSource === es) currentEventSource = null;
-      buildBtn.disabled = false;
-    });
-
-    es.onerror = () => {
-      // The server will close the stream when done; ignore auto-reconnect noise here.
-    };
+    startWatchingJob(data);
   };
 
   xhr.send(fd);
@@ -515,7 +595,7 @@ async function loadFixedInfo(){
       const sizeBytes = typeof item.sizeBytes === 'number' ? item.sizeBytes : 0;
       const durationSeconds = typeof item.durationSeconds === 'number' ? item.durationSeconds : 0;
       const lastWriteUnixMs = typeof item.lastWriteUnixMs === 'number' ? item.lastWriteUnixMs : Date.now();
-      const url = item.url ? String(item.url) : `/fixed/${encodeURIComponent(kind)}`;
+      const url = item.url ? String(item.url) : `/concat/fixed/${encodeURIComponent(kind)}`;
 
       const sizeText = sizeBytes > 0 ? humanSize(sizeBytes) : '';
       const durText = durationSeconds > 0 ? `${durationSeconds}s` : '';
@@ -560,7 +640,7 @@ async function uploadFixed(kind, file){
 
     const fd = new FormData();
     fd.append('file', file);
-    const r = await fetch(`/api/fixed/${encodeURIComponent(kind)}`, { method: 'POST', body: fd });
+    const r = await fetch(`/concat/api/concat/fixed/${encodeURIComponent(kind)}`, { method: 'POST', body: fd });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || !data.ok) {
       throw new Error(data?.error || data?.detail || `HTTP ${r.status}`);
@@ -598,7 +678,7 @@ function wireFixedPickers(){
 openBtn.addEventListener('click', async () => {
   if (!lastOutputFile) return;
   try{
-    await fetch(`/api/open-output?file=${encodeURIComponent(lastOutputFile)}`, { method: 'POST' });
+    await fetch(`/concat/api/open-output?file=${encodeURIComponent(lastOutputFile)}`, { method: 'POST' });
   }catch(_){}
 });
 
@@ -608,4 +688,8 @@ updateActiveUI();
 
 wireFixedPickers();
 loadFixedInfo().catch(() => {});
-
+loadJobFromUrl().then((loaded) => {
+  if (!loaded) {
+    importFromUrl();
+  }
+});

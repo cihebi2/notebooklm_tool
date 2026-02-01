@@ -966,21 +966,10 @@ function renderFiles(job){
       importBtn.className = "btn";
       importBtn.textContent = "一键导入拼接";
       importBtn.addEventListener("click", async () => {
-        const win = window.open("/concat", "_blank");
-        try{
-          const res = await fetch("/concat/api/import", {
-            method: "POST",
-            headers: {"Content-Type":"application/json"},
-            body: JSON.stringify({ job_id: job.id, file: f.name }),
-          });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok || !data.ok){
-            throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
-          }
-          alert(`已导入拼接：${data.outputFile || f.name}`);
-        }catch(e){
-          if (win && win.close) try{ win.close(); }catch(_){}
-          alert(`导入拼接失败：${String(e)}`);
+        const url = `/concat?import_job=${encodeURIComponent(job.id)}&file=${encodeURIComponent(f.name)}`;
+        const win = window.open(url, "_blank");
+        if (!win){
+          alert("浏览器阻止了弹窗，请允许打开新窗口后重试。");
         }
       });
       right.append(importBtn);
@@ -1952,14 +1941,10 @@ function renderTransitionList(){
       await handleFile(file);
     });
 
-    if (lock){
-      input.disabled = true;
-      repeat.disabled = true;
-      duration.disabled = true;
-      drop.classList.add("disabled");
-      drop.style.pointerEvents = "none";
-      drop.textContent = "已锁定";
-    }
+    input.disabled = false;
+    drop.classList.remove("disabled");
+    drop.style.pointerEvents = "";
+    drop.textContent = lock ? "替换默认" : "拖拽或点击选择";
 
     cell.append(input, repeat, duration, drop, fileInput);
     row.append(label, cell);
