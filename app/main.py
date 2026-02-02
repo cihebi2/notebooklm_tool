@@ -18,6 +18,11 @@ from .accounts_store import AccountsStore
 from .concat_service import ConcatService
 from .config import get_paths
 from .jobs import JobConfig, JobManager
+from .utils.audio_concat import concat_audio, concat_audio_with_transitions
+from .utils.audio_duration import get_audio_duration
+from .utils.silence_detect import detect_silence_segments, segments_to_payload
+from .utils.waveform import compute_waveform_peaks
+from .utils.document_parse import extract_text_from_bytes
 from .login_sessions import LoginSessionManager
 
 paths = get_paths()
@@ -311,7 +316,16 @@ async def create_job(
         raise HTTPException(status_code=400, detail="Provide report_text or report_file")
     if report_text is None:
         report_bytes = await report_file.read() if report_file else b""
-        report_text = report_bytes.decode("utf-8", errors="replace")
+        ext = Path(report_file.filename or "").suffix.lower() if report_file else ""
+        try:
+            if ext in {".txt", ".md", ".text", ".pdf", ".docx"}:
+                report_text = extract_text_from_bytes(report_bytes, ext)
+            else:
+                report_text = report_bytes.decode("utf-8", errors="replace")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e) or type(e).__name__)
 
     report_text = report_text.strip()
     if len(report_text) < 200:
@@ -319,6 +333,35 @@ async def create_job(
 
     job = await job_manager.create_and_start_job(config_obj, report_text)
     return job.to_public_dict()
+
+
+@app.post("/api/parse-file")
+async def parse_report_file(file: UploadFile = File(...)) -> dict[str, Any]:
+    name = str(file.filename or "")
+    ext = Path(name).suffix.lower()
+    if not ext:
+        raise HTTPException(status_code=400, detail="file has no extension")
+    if ext == ".doc":
+        raise HTTPException(status_code=400, detail="doc format not supported; please convert to docx or pdf")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="file is empty")
+
+    try:
+        text = extract_text_from_bytes(data, ext)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e) or type(e).__name__)
+
+    return {
+        "ok": True,
+        "filename": name,
+        "ext": ext,
+        "chars": len(text),
+        "text": text,
+    }
 
 
 @app.get("/api/jobs")
@@ -341,6 +384,109 @@ async def get_job_event_log(job_id: str, limit: int = 2000) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="job not found")
     lim = max(1, min(int(limit), 10000))
     return {"job_id": job_id, "events": job.event_log[-lim:]}
+
+
+@app.get("/api/jobs/{job_id}/waveform")
+async def get_job_waveform(
+    job_id: str,
+    file: str,
+    points: int = 1200,
+    min_silence_s: float | None = None,
+    threshold_db: float | None = None,
+) -> dict[str, Any]:
+    job = job_manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    name = Path(file or "").name
+    if not name:
+        raise HTTPException(status_code=400, detail="file is empty")
+
+    base = job.outputs_dir.resolve()
+    path = (base / name).resolve()
+    if not path.is_relative_to(base):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="file not found")
+
+    points = int(points or 1200)
+    if points < 200:
+        points = 200
+    if points > 5000:
+        points = 5000
+
+    cfg = getattr(job, "config", None)
+    min_silence = (
+        float(min_silence_s)
+        if min_silence_s is not None
+        else float(getattr(cfg, "silence_min_duration_s", 5.0))
+    )
+    threshold = (
+        float(threshold_db)
+        if threshold_db is not None
+        else float(getattr(cfg, "silence_threshold_db", -50.0))
+    )
+
+    cache_dir = base / ".waveforms"
+    cache_dir.mkdir(exist_ok=True)
+    cache_key = _sanitize_filename(f"{name}_{points}_{min_silence}_{threshold}")
+    cache_path = cache_dir / f"{cache_key}.json"
+    audio_mtime = path.stat().st_mtime
+
+    if cache_path.exists() and cache_path.stat().st_mtime >= audio_mtime:
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    def _compute() -> dict[str, Any]:
+        peaks, duration = compute_waveform_peaks(path, points=points, sample_rate=2000)
+        silence_segments: list[dict[str, float | str]] = []
+        silence_error: str | None = None
+        try:
+            segments = detect_silence_segments(
+                path, min_duration_s=min_silence, threshold_db=threshold
+            )
+            silence_segments = segments_to_payload(segments)
+        except Exception as e:
+            silence_error = str(e) or type(e).__name__
+        payload: dict[str, Any] = {
+            "ok": True,
+            "file": name,
+            "points": points,
+            "peaks": peaks,
+            "duration_seconds": round(float(duration), 3),
+            "silence_segments": silence_segments,
+            "min_silence_duration_s": min_silence,
+            "threshold_db": threshold,
+        }
+        if silence_error:
+            payload["silence_error"] = silence_error
+        return payload
+
+    data = await asyncio.to_thread(_compute)
+    try:
+        cache_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    return data
+
+
+@app.get("/concat/api/jobs/{job_id}/waveform")
+async def get_job_waveform_concat(
+    job_id: str,
+    file: str,
+    points: int = 1200,
+    min_silence_s: float | None = None,
+    threshold_db: float | None = None,
+) -> dict[str, Any]:
+    return await get_job_waveform(
+        job_id=job_id,
+        file=file,
+        points=points,
+        min_silence_s=min_silence_s,
+        threshold_db=threshold_db,
+    )
 
 
 @app.get("/api/jobs/{job_id}/events.jsonl")
@@ -435,6 +581,25 @@ class ConcatImportRequest(BaseModel):
     repeat: int | None = None
     quality: int | None = None
     output_name: str | None = None
+
+
+class ConcatImportOutputRequest(BaseModel):
+    file: str
+    repeat: int | None = None
+    quality: int | None = None
+    output_name: str | None = None
+
+
+class ConcatStitchPartsRequest(BaseModel):
+    job_id: str
+    parts: list[str]
+    output_name: str | None = None
+    output_format: str | None = "m4a"
+    transition_enabled: bool = False
+    transition_fade_seconds: float = 3.0
+    transition_files: list[str] = Field(default_factory=list)
+    transition_repeats: list[int] = Field(default_factory=list)
+    transition_durations: list[float] = Field(default_factory=list)
 
 
 @app.post("/api/jobs/{job_id}/stitch")
@@ -804,4 +969,122 @@ async def concat_import(req: ConcatImportRequest) -> dict[str, Any]:
         "outputPath": str(concat_job.output_path),
         "eventsUrl": f"/concat/api/jobs/{concat_job.id}/events",
         "downloadUrl": f"/concat/download/{concat_job.output_file}",
+    }
+
+
+@app.post("/concat/api/import-output")
+async def concat_import_output(req: ConcatImportOutputRequest) -> dict[str, Any]:
+    name = Path(req.file or "").name
+    if not name:
+        raise HTTPException(status_code=400, detail="file is empty")
+    src = (concat_service.output_dir / name).resolve()
+    if not src.exists() or not src.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+
+    repeat = int(req.repeat or 3)
+    if repeat < 1 or repeat > 20:
+        repeat = 3
+    quality = int(req.quality or 5)
+    if quality < 0 or quality > 9:
+        quality = 5
+
+    loop = asyncio.get_running_loop()
+    concat_job = concat_service.create_job(
+        upload_paths=[src],
+        repeat=repeat,
+        quality=quality,
+        output_name=req.output_name or src.stem,
+        loop=loop,
+    )
+
+    return {
+        "ok": True,
+        "jobId": concat_job.id,
+        "outputFile": concat_job.output_file,
+        "outputPath": str(concat_job.output_path),
+        "eventsUrl": f"/concat/api/jobs/{concat_job.id}/events",
+        "downloadUrl": f"/concat/download/{concat_job.output_file}",
+    }
+
+
+@app.post("/concat/api/stitch-parts")
+async def concat_stitch_parts(req: ConcatStitchPartsRequest) -> dict[str, Any]:
+    job = job_manager.get(req.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    base = job.outputs_dir.resolve()
+    parts: list[Path] = []
+    for raw in (req.parts or []):
+        name = Path(str(raw or "")).name
+        if not name:
+            continue
+        path = (base / name).resolve()
+        if not path.is_relative_to(base):
+            raise HTTPException(status_code=400, detail=f"invalid filename: {name}")
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"file not found: {name}")
+        parts.append(path)
+
+    if not parts:
+        raise HTTPException(status_code=400, detail="parts is empty")
+
+    output_format = str(req.output_format or "m4a").strip().lower()
+    if output_format not in {"mp3", "mp4", "m4a"}:
+        raise HTTPException(status_code=400, detail="output_format must be mp3, mp4, or m4a")
+
+    name = _sanitize_filename(req.output_name or "")
+    if not name:
+        name = f"main_{job.id}_{datetime.now():%Y%m%d_%H%M%S}"
+    if not name.lower().endswith(f".{output_format}"):
+        name += f".{output_format}"
+    output_path = concat_service.output_dir / name
+
+    transition_enabled = bool(req.transition_enabled)
+    transition_files = list(req.transition_files or [])
+    transition_repeats = list(req.transition_repeats or [])
+    transition_durations = list(req.transition_durations or [])
+    fade_seconds = float(req.transition_fade_seconds or 0.0)
+
+    transitions: list[Path | None] = []
+    if transition_enabled:
+        gaps = max(0, len(parts) - 1)
+        for i in range(gaps):
+            raw = str(transition_files[i] if i < len(transition_files) else "").strip()
+            if not raw:
+                transitions.append(None)
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                p = (paths.base_dir / raw).resolve()
+            if not p.exists():
+                transitions.append(None)
+            else:
+                transitions.append(p)
+
+    loop = asyncio.get_running_loop()
+
+    def _run() -> None:
+        if transition_enabled and any(isinstance(p, Path) for p in transitions):
+            concat_audio_with_transitions(
+                parts,
+                transitions,
+                output_path,
+                output_format=output_format,
+                fade_seconds=fade_seconds,
+                transition_repeats=transition_repeats,
+                transition_durations=transition_durations,
+            )
+        else:
+            concat_audio(parts, output_path, output_format=output_format)
+
+    await loop.run_in_executor(None, _run)
+    duration = get_audio_duration(output_path)
+
+    return {
+        "ok": True,
+        "outputFile": output_path.name,
+        "outputPath": str(output_path),
+        "downloadUrl": f"/concat/download/{output_path.name}",
+        "durationSeconds": int(round(duration.seconds)),
     }

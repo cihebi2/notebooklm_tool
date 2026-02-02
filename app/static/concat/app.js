@@ -19,6 +19,29 @@ const fixedIntroPlayer = document.getElementById('fixedIntroPlayer');
 const fixedOutroPlayer = document.getElementById('fixedOutroPlayer');
 const fixedTailPlayer = document.getElementById('fixedTailPlayer');
 
+const jobSelect = document.getElementById('jobSelect');
+const jobRefreshBtn = document.getElementById('jobRefresh');
+const jobLoadBtn = document.getElementById('jobLoad');
+const candidateListEl = document.getElementById('candidateList');
+const candidateSummaryEl = document.getElementById('candidateSelectionSummary');
+const stitchOutputNameInput = document.getElementById('stitchOutputName');
+const stitchOutputFormatSelect = document.getElementById('stitchOutputFormat');
+const stitchPartsBtn = document.getElementById('stitchPartsBtn');
+const stitchAutoPickBtn = document.getElementById('stitchAutoPick');
+const stitchPartsResultEl = document.getElementById('stitchPartsResult');
+
+const STORAGE_THEME = "notebooklm.uiTheme";
+const THEME_DARK = "dark";
+const THEME_LIGHT = "light";
+
+const transitionEnabledEl = document.getElementById('transitionEnabled');
+const transitionFadeEl = document.getElementById('transitionFade');
+const transitionListEl = document.getElementById('transitionList');
+
+const importedBox = document.getElementById('importedBox');
+const importedName = document.getElementById('importedName');
+const importedClear = document.getElementById('importedClear');
+
 const buildBtn = document.getElementById('build');
 const openBtn = document.getElementById('openOutput');
 const repeatInput = document.getElementById('repeat');
@@ -36,6 +59,28 @@ let singleFile = null;
 let multiFiles = [];
 let lastOutputFile = null;
 let currentEventSource = null;
+let importSource = null;
+let candidateSegments = 0;
+let candidateSelection = {};
+const waveformCache = new Map();
+const waveformInflight = new Map();
+
+function renderCandidateSummary(){
+  if (!candidateSummaryEl) return;
+  const segs = Number(candidateSegments || 0);
+  if (!segs){
+    candidateSummaryEl.innerHTML = "";
+    return;
+  }
+  const rows = [];
+  for (let i=1;i<=segs;i++){
+    const file = candidateSelection[i];
+    const label = `第${i}段`;
+    const text = file ? file : "未选择";
+    rows.push(`<div class="row"><span>${label}</span><span class="file">${text}</span></div>`);
+  }
+  candidateSummaryEl.innerHTML = rows.join("");
+}
 
 let outputNameAuto = true;
 let lastAutoOutputName = '';
@@ -44,6 +89,19 @@ const fixedUi = {
   intro: { infoEl: fixedIntroInfo, pickBtn: fixedIntroPick, fileEl: fixedIntroFile, playerEl: fixedIntroPlayer },
   outro: { infoEl: fixedOutroInfo, pickBtn: fixedOutroPick, fileEl: fixedOutroFile, playerEl: fixedOutroPlayer },
   tail: { infoEl: fixedTailInfo, pickBtn: fixedTailPick, fileEl: fixedTailFile, playerEl: fixedTailPlayer },
+};
+
+const STORAGE_STITCH_TRANSITIONS = "notebooklm.stitchTransitions";
+const STORAGE_STITCH_TRANSITION_REPEATS = "notebooklm.stitchTransitionRepeats";
+const STORAGE_STITCH_TRANSITION_DURATIONS = "notebooklm.stitchTransitionDurations";
+const DEFAULT_TRANSITIONS_BY_SEGMENTS = {
+  3: [
+    "assets/transitions/第一二段之间的链接-轻快活泼自由自在尤克里里.wav",
+    "assets/transitions/第二三段之间的连接-欢快轻快节奏活力阳光.wav",
+  ],
+};
+const DEFAULT_TRANSITION_DURATIONS_BY_SEGMENTS = {
+  3: [30, 25],
 };
 
 function humanSize(bytes){
@@ -55,6 +113,205 @@ function humanSize(bytes){
 
 function clamp(n, min, max){
   return Math.max(min, Math.min(max, n));
+}
+
+function _currentTheme(){
+  return document.documentElement?.dataset?.theme || "dark";
+}
+
+function drawWaveform(canvas, peaks, segments, durationSeconds){
+  if (!canvas || !peaks || !peaks.length) return;
+  const theme = _currentTheme();
+  const width = canvas.clientWidth || 320;
+  const height = canvas.clientHeight || 64;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.floor(width * dpr));
+  canvas.height = Math.max(1, Math.floor(height * dpr));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, width, height);
+
+  const baseFill = theme === "light" ? "rgba(30,26,36,0.08)" : "rgba(255,255,255,0.06)";
+  ctx.fillStyle = baseFill;
+  ctx.fillRect(0, 0, width, height);
+
+  if (durationSeconds && segments && segments.length){
+    ctx.fillStyle = "rgba(255, 80, 80, 0.28)";
+    for (const seg of segments){
+      const start = Math.max(0, Number(seg.start_s || 0));
+      const end = Math.max(start, Number(seg.end_s || 0));
+      if (durationSeconds <= 0) continue;
+      const x = (start / durationSeconds) * width;
+      const w = Math.max(1, ((end - start) / durationSeconds) * width);
+      ctx.fillRect(x, 0, w, height);
+    }
+  }
+
+  const mid = height / 2;
+  const stroke = theme === "light" ? "rgba(30,26,36,0.65)" : "rgba(248,244,235,0.82)";
+  ctx.strokeStyle = stroke;
+  ctx.lineWidth = 1;
+
+  const step = width / peaks.length;
+  ctx.beginPath();
+  for (let i=0;i<peaks.length;i++){
+    const v = Math.min(1, Math.max(0, Number(peaks[i]) || 0));
+    const h = v * (height * 0.44);
+    const x = i * step;
+    ctx.moveTo(x, mid - h);
+    ctx.lineTo(x, mid + h);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+async function loadWaveform(jobId, file, canvas, hintEl){
+  if (!jobId || !file || !canvas) return;
+  if (canvas.dataset.loaded === "1") return;
+  const key = `${jobId}::${file}`;
+  if (waveformCache.has(key)){
+    const data = waveformCache.get(key);
+    drawWaveform(canvas, data.peaks || [], data.silence_segments || [], data.duration_seconds || 0);
+    canvas.dataset.loaded = "1";
+    if (hintEl){
+      const count = (data.silence_segments || []).length;
+      hintEl.textContent = count ? `静音区 ${count} 处` : "未检测到静音";
+    }
+    return;
+  }
+  if (hintEl) hintEl.textContent = "波形生成中…";
+  let promise = waveformInflight.get(key);
+  if (!promise){
+    const url = `/api/jobs/${encodeURIComponent(jobId)}/waveform?file=${encodeURIComponent(file)}`;
+    promise = fetch(url).then(async (r) => {
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || !data.ok){
+        throw new Error(data?.detail || data?.error || `HTTP ${r.status}`);
+      }
+      return data;
+    });
+    waveformInflight.set(key, promise);
+  }
+  try{
+    const data = await promise;
+    waveformCache.set(key, data);
+    drawWaveform(canvas, data.peaks || [], data.silence_segments || [], data.duration_seconds || 0);
+    canvas.dataset.loaded = "1";
+    if (hintEl){
+      const count = (data.silence_segments || []).length;
+      hintEl.textContent = count ? `静音区 ${count} 处` : "未检测到静音";
+    }
+  }catch(e){
+    if (hintEl) hintEl.textContent = `波形失败：${String(e)}`;
+  }finally{
+    waveformInflight.delete(key);
+  }
+}
+
+function applyTheme(theme){
+  const root = document.documentElement;
+  const body = document.body;
+  const normalized = theme === THEME_LIGHT ? THEME_LIGHT : THEME_DARK;
+  root.dataset.theme = normalized;
+  if (body) body.dataset.theme = normalized;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta){
+    meta.setAttribute("content", normalized === THEME_LIGHT ? "#f6f1e8" : "#0b0b12");
+  }
+  const btn = document.getElementById("themeToggle");
+  if (btn){
+    btn.textContent = normalized === THEME_LIGHT ? "切换到暗色" : "切换到亮色";
+  }
+  try{
+    localStorage.setItem(STORAGE_THEME, normalized);
+  }catch{}
+}
+
+function initThemeToggle(){
+  const saved = (() => {
+    try{
+      return localStorage.getItem(STORAGE_THEME);
+    }catch{
+      return null;
+    }
+  })();
+  applyTheme(saved || THEME_DARK);
+  const btn = document.getElementById("themeToggle");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    const current = document.documentElement.dataset.theme || THEME_DARK;
+    applyTheme(current === THEME_LIGHT ? THEME_DARK : THEME_LIGHT);
+  });
+}
+
+function _readJSON(key, fallback){
+  try{
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  }catch{
+    return fallback;
+  }
+}
+
+function _writeJSON(key, value){
+  try{
+    localStorage.setItem(key, JSON.stringify(value));
+  }catch{}
+}
+
+function _readTransitions(){
+  return _readJSON(STORAGE_STITCH_TRANSITIONS, []);
+}
+function _writeTransitions(list){
+  _writeJSON(STORAGE_STITCH_TRANSITIONS, list || []);
+}
+function _readTransitionRepeats(){
+  return _readJSON(STORAGE_STITCH_TRANSITION_REPEATS, []);
+}
+function _writeTransitionRepeats(list){
+  _writeJSON(STORAGE_STITCH_TRANSITION_REPEATS, list || []);
+}
+function _readTransitionDurations(){
+  return _readJSON(STORAGE_STITCH_TRANSITION_DURATIONS, []);
+}
+function _writeTransitionDurations(list){
+  _writeJSON(STORAGE_STITCH_TRANSITION_DURATIONS, list || []);
+}
+
+function _normalizeTransitions(list, segments){
+  const gaps = Math.max(0, (segments || 0) - 1);
+  const out = Array.isArray(list) ? list.slice(0, gaps) : [];
+  while (out.length < gaps) out.push("");
+  return out;
+}
+function _normalizeTransitionRepeats(list, segments){
+  const gaps = Math.max(0, (segments || 0) - 1);
+  const out = Array.isArray(list) ? list.slice(0, gaps) : [];
+  for (let i=0;i<out.length;i++){
+    const n = parseInt(String(out[i] ?? "1"), 10);
+    out[i] = Number.isFinite(n) ? Math.max(0, Math.min(n, 5)) : 1;
+  }
+  while (out.length < gaps) out.push(1);
+  return out;
+}
+function _normalizeTransitionDurations(list, segments){
+  const gaps = Math.max(0, (segments || 0) - 1);
+  const out = Array.isArray(list) ? list.slice(0, gaps) : [];
+  for (let i=0;i<out.length;i++){
+    const n = parseFloat(String(out[i] ?? "0"));
+    out[i] = Number.isFinite(n) ? Math.max(0, n) : 0;
+  }
+  while (out.length < gaps) out.push(30);
+  return out;
+}
+function _defaultTransitions(segments){
+  return (DEFAULT_TRANSITIONS_BY_SEGMENTS[segments] || []).slice();
+}
+function _defaultTransitionDurations(segments){
+  return (DEFAULT_TRANSITION_DURATIONS_BY_SEGMENTS[segments] || []).slice();
 }
 
 function defaultOutputNameFromFileName(fileName){
@@ -100,6 +357,32 @@ function resetResult(){
   lastOutputFile = null;
   openBtn.disabled = true;
   resetProgress();
+}
+
+function setImportSource(source){
+  if (!source || !source.file) {
+    importSource = null;
+  } else {
+    importSource = {
+      kind: source.kind || 'job',
+      jobId: source.jobId ? String(source.jobId) : '',
+      file: String(source.file),
+    };
+  }
+  if (importedBox){
+    if (importSource){
+      importedBox.style.display = 'flex';
+      if (importedName) importedName.textContent = importSource.file;
+    } else {
+      importedBox.style.display = 'none';
+      if (importedName) importedName.textContent = '';
+    }
+  }
+  updateActiveUI();
+}
+
+function clearImportSource(){
+  setImportSource(null);
 }
 
 const stageMap = {
@@ -250,51 +533,207 @@ async function importFromUrl(){
   if (!jobId || !file) return false;
 
   resetResult();
-  setStatus('已导入文件，开始拼接…');
+  setStatus('已导入文件，等待拼接…');
 
-  if (pickedSingleEl){
-    pickedSingleEl.textContent = file;
-    pickedSingleEl.classList.remove('muted');
-  }
-  if (pickedActiveEl){
-    pickedActiveEl.textContent = '单段主音频（导入）';
-    pickedActiveEl.classList.remove('muted');
-  }
-
-  const repeat = parseInt(repeatInput?.value || '3', 10);
-  const quality = parseInt(qualitySelect?.value || '5', 10);
+  singleFile = null;
+  multiFiles = [];
+  updateSingleUI();
+  updateMultiUI();
+  setImportSource({ kind: 'job', jobId, file });
   if (outputNameInput){
     const name = defaultOutputNameFromFileName(file);
     suggestOutputName(name);
   }
-
-  try{
-    const res = await fetch('/concat/api/import', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        job_id: jobId,
-        file,
-        repeat: Number.isFinite(repeat) ? repeat : 3,
-        quality: Number.isFinite(quality) ? quality : 5,
-        output_name: outputNameInput?.value || '',
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok){
-      throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
-    }
-    startWatchingJob(data);
-    return true;
-  }catch(e){
-    setStatus(`导入失败：${String(e)}`);
-    buildBtn.disabled = false;
-    return false;
-  }
+  return true;
 }
 
 function fileSort(a, b){
   return a.name.localeCompare(b.name, 'zh-CN', { numeric: true, sensitivity: 'base' });
+}
+
+async function loadJobsList(){
+  if (!jobSelect) return;
+  try{
+    const res = await fetch('/api/jobs');
+    const jobs = await res.json();
+    jobSelect.innerHTML = '';
+    if (!Array.isArray(jobs) || jobs.length === 0){
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '暂无任务';
+      jobSelect.append(opt);
+      return;
+    }
+    for (const j of jobs){
+      const opt = document.createElement('option');
+      opt.value = j.id;
+      const created = j.created_at ? String(j.created_at).replace('T',' ').slice(0,19) : '';
+      const title = j.config?.split_enabled ? `分段×${j.config?.split_segments || '?'}` : '整段';
+      opt.textContent = `${created} · ${title} · ${j.id}`;
+      jobSelect.append(opt);
+    }
+  }catch(e){
+    if (jobSelect){
+      jobSelect.innerHTML = '';
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '加载失败';
+      jobSelect.append(opt);
+    }
+  }
+}
+
+async function loadCandidatesForJob(jobId){
+  if (!candidateListEl) return;
+  candidateListEl.innerHTML = '<div class="muted">加载候选中…</div>';
+  candidateSelection = {};
+  candidateSegments = 0;
+  renderCandidateSummary();
+  try{
+    const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+    if (!res.ok) throw new Error(await res.text());
+    const job = await res.json();
+    candidateSegments = Number(job?.config?.split_segments || 0);
+
+    const evRes = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/event_log?limit=20000`);
+    const evData = evRes.ok ? await evRes.json() : {};
+    const events = Array.isArray(evData?.events) ? evData.events : [];
+
+    const byPart = {};
+    for (const ev of events){
+      if (String(ev?.type || '') !== 'part_accepted') continue;
+      const part = Number(ev.part || 0);
+      if (!part) continue;
+      if (!byPart[part]) byPart[part] = [];
+      byPart[part].push({
+        file: ev.file,
+        duration: Number(ev.duration_minutes || 0),
+        account: ev.account_name || ev.account_id || '',
+      });
+    }
+
+    renderCandidates(jobId, byPart, candidateSegments);
+    renderTransitionListForSegments(candidateSegments || 0);
+    renderCandidateSummary();
+  }catch(e){
+    candidateListEl.innerHTML = `<div class="muted">加载失败：${String(e)}</div>`;
+  }
+}
+
+function renderCandidates(jobId, byPart, segments){
+  if (!candidateListEl) return;
+  candidateListEl.innerHTML = '';
+
+  const segs = Number(segments || 0);
+  if (!segs){
+    candidateListEl.innerHTML = '<div class="muted">未检测到分段信息。</div>';
+    return;
+  }
+
+  for (let i=1;i<=segs;i++){
+    const items = Array.isArray(byPart?.[i]) ? byPart[i].slice() : [];
+    items.sort((a,b) => (b.duration || 0) - (a.duration || 0));
+
+    const group = document.createElement('div');
+    group.className = 'candidateGroup';
+
+    const head = document.createElement('div');
+    head.className = 'candidateHead';
+    head.innerHTML = `<strong>第 ${i} 段</strong><span class="muted">${items.length} 条候选</span>`;
+
+    const list = document.createElement('div');
+    list.className = 'candidateItems';
+
+    if (!items.length){
+      const empty = document.createElement('div');
+      empty.className = 'muted';
+      empty.textContent = '暂无候选（请稍等或回到生成页继续生成）';
+      list.append(empty);
+    } else {
+      for (const item of items){
+        const row = document.createElement('label');
+        row.className = 'candidateItem';
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = `part-${i}`;
+        radio.value = item.file;
+        radio.addEventListener('change', () => {
+          if (radio.checked) {
+            candidateSelection[i] = item.file;
+            const group = row.closest('.candidateGroup');
+            if (group){
+              group.querySelectorAll('.candidateItem').forEach(el => el.classList.remove('selected'));
+            }
+            row.classList.add('selected');
+            renderCandidateSummary();
+            if (waveCanvas) loadWaveform(jobId, item.file, waveCanvas, waveHint);
+          }
+        });
+        const meta = document.createElement('div');
+        meta.className = 'candidateMeta';
+        const dur = Number.isFinite(item.duration) ? `${item.duration.toFixed(2).replace(/\\.00$/,'')} min` : '-';
+        meta.textContent = `${dur} · ${item.account || ''} · ${item.file}`;
+        const audio = document.createElement('audio');
+        audio.className = 'candidateAudio';
+        audio.controls = true;
+        audio.preload = 'none';
+        audio.src = `/download/${encodeURIComponent(jobId)}/${encodeURIComponent(item.file)}`;
+
+        const waveWrap = document.createElement('div');
+        waveWrap.className = 'waveWrap';
+        const waveHead = document.createElement('div');
+        waveHead.className = 'waveHead';
+        const waveBtn = document.createElement('button');
+        waveBtn.type = 'button';
+        waveBtn.className = 'btn secondary mini';
+        waveBtn.textContent = '显示波形';
+        waveBtn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          loadWaveform(jobId, item.file, waveCanvas, waveHint);
+        });
+        const waveHint = document.createElement('span');
+        waveHint.className = 'waveHint muted';
+        waveHint.textContent = '未加载';
+        waveHead.append(waveBtn, waveHint);
+        const waveCanvas = document.createElement('canvas');
+        waveCanvas.className = 'waveCanvas';
+        waveCanvas.height = 64;
+        waveWrap.append(waveHead, waveCanvas);
+
+        row.append(radio, meta, audio, waveWrap);
+        list.append(row);
+      }
+    }
+
+    group.append(head, list);
+    candidateListEl.append(group);
+  }
+  renderCandidateSummary();
+}
+
+function autoPickLongest(){
+  if (!candidateListEl) return;
+  const groups = candidateListEl.querySelectorAll('.candidateGroup');
+  groups.forEach(group => {
+    const radios = group.querySelectorAll('input[type=radio]');
+    if (radios.length > 0) {
+      const first = radios[0];
+      first.checked = true;
+      const name = first.name;
+      const part = Number(String(name || '').replace('part-',''));
+      candidateSelection[part] = first.value;
+      group.querySelectorAll('.candidateItem').forEach(el => el.classList.remove('selected'));
+      const label = first.closest('.candidateItem');
+      if (label) {
+        label.classList.add('selected');
+        const canvas = label.querySelector('.waveCanvas');
+        const hint = label.querySelector('.waveHint');
+        if (canvas) loadWaveform(jobSelect?.value, first.value, canvas, hint);
+      }
+    }
+  });
+  renderCandidateSummary();
 }
 
 function suggestOutputName(name){
@@ -397,12 +836,13 @@ function updateMultiUI(){
 function getActive(){
   if (multiFiles && multiFiles.length > 0) return { mode: 'multi', files: multiFiles };
   if (singleFile) return { mode: 'single', files: [singleFile] };
+  if (importSource) return { mode: 'import', files: [] };
   return { mode: 'none', files: [] };
 }
 
 function updateActiveUI(){
   const active = getActive();
-  buildBtn.disabled = active.files.length === 0;
+  buildBtn.disabled = (active.mode === 'none');
 
   if (active.mode === 'multi') {
     pickedActiveEl.textContent = `多段主音频（${active.files.length} 段）`;
@@ -414,6 +854,13 @@ function updateActiveUI(){
     pickedActiveEl.classList.remove('muted');
     suggestOutputName(defaultOutputNameFromFileName(singleFile.name));
     setStatus('已选择单段主音频，等待开始');
+  } else if (active.mode === 'import') {
+    pickedActiveEl.textContent = '导入主音频';
+    pickedActiveEl.classList.remove('muted');
+    if (importSource) {
+      suggestOutputName(defaultOutputNameFromFileName(importSource.file));
+    }
+    setStatus('已导入主音频，等待开始');
   } else {
     pickedActiveEl.textContent = '未选择';
     pickedActiveEl.classList.add('muted');
@@ -421,8 +868,154 @@ function updateActiveUI(){
   }
 }
 
+function renderTransitionListForSegments(segments){
+  if (!transitionListEl) return;
+  const gaps = Math.max(0, (segments || 0) - 1);
+  const list = _normalizeTransitions(_readTransitions(), segments);
+  const repeats = _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
+  const durations = _normalizeTransitionDurations(_readTransitionDurations(), segments);
+
+  if (gaps <= 0){
+    transitionListEl.innerHTML = `<div class="muted">当前分段不足 2 段，无需过渡音频。</div>`;
+    return;
+  }
+
+  const defaults = _defaultTransitions(segments);
+  if (defaults.length && list.every(v => !v)){
+    _writeTransitions(_normalizeTransitions(defaults, segments));
+  }
+  const defDur = _defaultTransitionDurations(segments);
+  if (defDur.length){
+    _writeTransitionDurations(_normalizeTransitionDurations(defDur, segments));
+  }
+
+  const uploadTransitionFile = async (file) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/api/transitions/upload", { method: "POST", body: form });
+    if (!res.ok){
+      throw new Error(await res.text());
+    }
+    const data = await res.json();
+    return String(data?.path || "");
+  };
+
+  transitionListEl.innerHTML = "";
+  const transitions = _normalizeTransitions(_readTransitions(), segments);
+  const rep = _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
+  const dur = _normalizeTransitionDurations(_readTransitionDurations(), segments);
+
+  for (let i=1;i<=gaps;i++){
+    const row = document.createElement("div");
+    row.className = "transitionRow";
+    const label = document.createElement("div");
+    label.className = "muted";
+    label.textContent = `第 ${i}-${i+1} 段过渡音频（重复/时长秒）`;
+
+    const cell = document.createElement("div");
+    cell.className = "transitionCell";
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "transitionInput";
+    input.placeholder = "可选：填写本地路径，或拖拽音频文件到右侧";
+    input.value = transitions[i - 1] || "";
+    input.addEventListener("input", () => {
+      const next = _normalizeTransitions(_readTransitions(), segments);
+      next[i - 1] = String(input.value || "");
+      _writeTransitions(next);
+    });
+
+    const repeat = document.createElement("input");
+    repeat.type = "number";
+    repeat.min = "0";
+    repeat.max = "5";
+    repeat.step = "1";
+    repeat.className = "transitionRepeat";
+    repeat.value = String(rep[i - 1] ?? 1);
+    repeat.title = "过渡音频重复次数（0 表示不插入）";
+    repeat.addEventListener("input", () => {
+      const next = _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
+      next[i - 1] = parseInt(repeat.value || "1", 10);
+      _writeTransitionRepeats(next);
+    });
+
+    const duration = document.createElement("input");
+    duration.type = "number";
+    duration.min = "0";
+    duration.max = "600";
+    duration.step = "1";
+    duration.className = "transitionDuration";
+    duration.value = String(dur[i - 1] ?? 30);
+    duration.title = "过渡音频时长（秒，0 表示使用原始时长，超过则循环）";
+    duration.addEventListener("input", () => {
+      const next = _normalizeTransitionDurations(_readTransitionDurations(), segments);
+      next[i - 1] = parseFloat(duration.value || "0");
+      _writeTransitionDurations(next);
+    });
+
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = "audio/*";
+    fileInput.className = "transitionFileInput";
+
+    const drop = document.createElement("div");
+    drop.className = "transitionDrop";
+    drop.textContent = "拖拽或点击选择";
+
+    const applyUploadedPath = (path) => {
+      if (!path) return;
+      input.value = path;
+      const next = _normalizeTransitions(_readTransitions(), segments);
+      next[i - 1] = String(path);
+      _writeTransitions(next);
+    };
+
+    const handleFile = async (file) => {
+      if (!file) return;
+      drop.classList.add("loading");
+      drop.textContent = "上传中…";
+      try{
+        const path = await uploadTransitionFile(file);
+        applyUploadedPath(path);
+      }catch(e){
+        alert(`过渡音频上传失败：${String(e)}`);
+      }finally{
+        drop.classList.remove("loading");
+        drop.textContent = "拖拽或点击选择";
+      }
+    };
+
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files?.[0];
+      await handleFile(file);
+      fileInput.value = "";
+    });
+
+    drop.addEventListener("click", () => fileInput.click());
+    drop.addEventListener("dragover", (ev) => {
+      ev.preventDefault();
+      drop.classList.add("drag");
+    });
+    drop.addEventListener("dragleave", () => {
+      drop.classList.remove("drag");
+    });
+    drop.addEventListener("drop", async (ev) => {
+      ev.preventDefault();
+      drop.classList.remove("drag");
+      const file = ev.dataTransfer?.files?.[0];
+      await handleFile(file);
+    });
+
+    cell.append(input, repeat, duration, drop, fileInput);
+    row.append(label, cell);
+    transitionListEl.append(row);
+  }
+}
+
 function setSingleFile(file){
   if (!file) return;
+  clearImportSource();
   singleFile = file;
   updateSingleUI();
   resetResult();
@@ -432,6 +1025,7 @@ function setSingleFile(file){
 function addMultiFiles(fileList){
   const incoming = Array.from(fileList || []).filter(f => f && f.size > 0);
   if (incoming.length === 0) return;
+  clearImportSource();
 
   const keyOf = (f) => `${f.name}::${f.size}::${f.lastModified}`;
   const map = new Map((multiFiles || []).map(f => [keyOf(f), f]));
@@ -491,13 +1085,56 @@ fileMultiInput.addEventListener('change', () => {
   fileMultiInput.value = '';
 });
 
+importedClear?.addEventListener('click', () => {
+  clearImportSource();
+  updateActiveUI();
+});
+
 buildBtn.addEventListener('click', async () => {
   const active = getActive();
-  if (!active.files || active.files.length === 0) return;
+  if (active.mode === 'none') return;
   buildBtn.disabled = true;
   resetResult();
-  setStatus('上传中…');
-  setProgress(0, '上传中 0%');
+  setStatus(active.mode === 'import' ? '开始拼接…' : '上传中…');
+  setProgress(0, active.mode === 'import' ? '准备中 0%' : '上传中 0%');
+
+  if (active.mode === 'import' && importSource){
+    try{
+      const repeat = parseInt(repeatInput.value || '3', 10);
+      const quality = parseInt(qualitySelect.value || '5', 10);
+      const endpoint = importSource.kind === 'concat' ? '/concat/api/import-output' : '/concat/api/import';
+      const payload = (importSource.kind === 'concat')
+        ? {
+            file: importSource.file,
+            repeat: Number.isFinite(repeat) ? repeat : 3,
+            quality: Number.isFinite(quality) ? quality : 5,
+            output_name: outputNameInput.value || '',
+          }
+        : {
+            job_id: importSource.jobId,
+            file: importSource.file,
+            repeat: Number.isFinite(repeat) ? repeat : 3,
+            quality: Number.isFinite(quality) ? quality : 5,
+            output_name: outputNameInput.value || '',
+          };
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok){
+        throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+      }
+      startWatchingJob(data);
+      return;
+    }catch(e){
+      setStatus('失败：' + String(e));
+      setProgress(0, '处理失败');
+      buildBtn.disabled = false;
+      return;
+    }
+  }
 
   const fd = new FormData();
   for (const f of active.files) fd.append('mainAudio', f);
@@ -675,6 +1312,82 @@ function wireFixedPickers(){
   }
 }
 
+async function stitchParts(){
+  const jobId = jobSelect?.value;
+  if (!jobId){
+    alert("请选择一个任务");
+    return;
+  }
+  const segs = Number(candidateSegments || 0);
+  if (!segs){
+    alert("未加载候选音频");
+    return;
+  }
+  const parts = [];
+  for (let i=1;i<=segs;i++){
+    const picked = candidateSelection[i];
+    if (!picked){
+      alert(`第 ${i} 段还没有选择候选`);
+      return;
+    }
+    parts.push(picked);
+  }
+
+  stitchPartsBtn.disabled = true;
+  stitchPartsResultEl.innerHTML = '<div class="muted">拼接处理中…</div>';
+
+  try{
+    const payload = {
+      job_id: jobId,
+      parts,
+      output_name: stitchOutputNameInput?.value || "",
+      output_format: stitchOutputFormatSelect?.value || "m4a",
+      transition_enabled: !!transitionEnabledEl?.checked,
+      transition_fade_seconds: parseFloat(transitionFadeEl?.value || "3"),
+      transition_files: _normalizeTransitions(_readTransitions(), segs),
+      transition_repeats: _normalizeTransitionRepeats(_readTransitionRepeats(), segs),
+      transition_durations: _normalizeTransitionDurations(_readTransitionDurations(), segs),
+    };
+    const res = await fetch("/concat/api/stitch-parts", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok){
+      throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    }
+    const duration = Number(data.durationSeconds || 0);
+    const durText = duration > 0 ? `${duration}s` : "未知时长";
+    const dl = data.downloadUrl || `/concat/download/${encodeURIComponent(data.outputFile)}`;
+    stitchPartsResultEl.innerHTML = "";
+    const line = document.createElement("div");
+    line.className = "result-line";
+    line.textContent = `主体拼接完成：${data.outputFile} · ${durText}`;
+    const actions = document.createElement("div");
+    actions.className = "actions compact";
+    const a = document.createElement("a");
+    a.href = dl;
+    a.target = "_blank";
+    a.textContent = "下载主体";
+    a.className = "btn";
+    const useBtn = document.createElement("button");
+    useBtn.type = "button";
+    useBtn.className = "btn secondary";
+    useBtn.textContent = "作为主音频";
+    useBtn.addEventListener("click", () => {
+      setImportSource({ kind: "concat", file: data.outputFile });
+      updateActiveUI();
+    });
+    actions.append(a, useBtn);
+    stitchPartsResultEl.append(line, actions);
+  }catch(e){
+    stitchPartsResultEl.innerHTML = `<div class="muted">拼接失败：${String(e)}</div>`;
+  }finally{
+    stitchPartsBtn.disabled = false;
+  }
+}
+
 openBtn.addEventListener('click', async () => {
   if (!lastOutputFile) return;
   try{
@@ -682,12 +1395,22 @@ openBtn.addEventListener('click', async () => {
   }catch(_){}
 });
 
+initThemeToggle();
 updateSingleUI();
 updateMultiUI();
 updateActiveUI();
 
 wireFixedPickers();
 loadFixedInfo().catch(() => {});
+loadJobsList();
+jobRefreshBtn?.addEventListener('click', loadJobsList);
+jobLoadBtn?.addEventListener('click', () => {
+  const jobId = jobSelect?.value;
+  if (jobId) loadCandidatesForJob(jobId);
+});
+stitchAutoPickBtn?.addEventListener('click', autoPickLongest);
+stitchPartsBtn?.addEventListener('click', stitchParts);
+renderTransitionListForSegments(3);
 loadJobFromUrl().then((loaded) => {
   if (!loaded) {
     importFromUrl();

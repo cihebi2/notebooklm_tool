@@ -51,6 +51,8 @@ if "%PORT%"=="" (
 
 echo [INFO] Starting server: http://127.0.0.1:%PORT%
 echo Press CTRL+C to stop.
+REM Open browser after a short delay (in a separate process)
+start "" /B cmd /c "timeout /t 2 >nul & start http://127.0.0.1:%PORT%"
 
 REM Note: On Windows, uvicorn --reload switches to SelectorEventLoop which breaks Playwright (browser login).
 REM Enable reload only when you really need it: run.bat 8000 reload

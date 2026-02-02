@@ -6,7 +6,7 @@
 
 ## 你能做什么
 
-- 网页粘贴或拖拽 `.txt/.md` 报告
+- 网页粘贴或拖拽 `.txt/.md/.pdf/.docx` 报告（`.doc` 请先转为 `.docx`）
 - 上传/管理多个账号的 `storage_state.json`
 - 可选「分段拼接」：按条目拆成多段（例如 3×15min）生成后自动拼接
 - 为每个账号设置最大尝试次数（比如 20 次）
@@ -29,11 +29,11 @@ python -m venv .venv
 
 打开：`http://127.0.0.1:8000`
 
-也可以直接双击运行：`run.bat`
+也可以直接双击运行：`启动-晨间播客工厂.bat`
 
-如果 8000 端口被占用/被系统保留，可指定端口：`run.bat 8001`
+如果 8000 端口被占用/被系统保留，可指定端口：`启动-晨间播客工厂.bat 8001`
 
-> Windows 注意：`uvicorn --reload` 会切换事件循环策略，可能导致 Playwright 无法启动（浏览器登录添加会报 `NotImplementedError`）。建议默认不启用 reload；需要开发热重载时再用 `run.bat 8000 reload`。
+> Windows 注意：`uvicorn --reload` 会切换事件循环策略，可能导致 Playwright 无法启动（浏览器登录添加会报 `NotImplementedError`）。建议默认不启用 reload；需要开发热重载时再用 `启动-晨间播客工厂.bat 8000 reload`。
 
 ## 准备多个账号的 storage_state.json
 
@@ -55,6 +55,20 @@ python -m venv .venv
 
 - 账号：`data/accounts/<account_id>/storage_state.json`
 - 任务输出：`data/jobs/<job_id>/outputs/*.mp4`
+
+## 文件命名规则（新版）
+
+所有**新生成/新拼接**的音频文件名统一为可读格式，方便在另一台电脑也能一眼看懂。  
+日期默认取“**明天**”（`YYYYMMDD`），时长以 `min` 表示（取整）。
+
+示例：
+
+- 分段候选：`20260202_第1段_候选01_18min_账号名.mp4`
+- 分段候选（静音不合格）：`20260202_第1段_候选01_18min_账号名_静音不合格.mp4`
+- 整段候选：`20260202_完整_候选01_42min_账号名.mp4`
+- 拼接成片：`20260202_成片_45min_账号名.m4a`  
+  - 若有多次拼接，会加“第2版/第3版”等前缀：  
+    `20260202_第2版_成片_45min_账号名.m4a`
 
 ## 时长检测
 
@@ -96,7 +110,7 @@ git pull
 .\.venv\Scripts\pip install -r requirements.txt
 ```
 
-如有运行中的服务，请先停止再启动（`run.bat` 或上面 uvicorn 命令）。
+如有运行中的服务，请先停止再启动（`启动-晨间播客工厂.bat` 或上面 uvicorn 命令）。
 
 ### 迁移已有账号/提示词/自定义音频
 

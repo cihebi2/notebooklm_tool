@@ -33,6 +33,81 @@ def _sanitize_filename(value: str) -> str:
     return value[:120] if value else "output"
 
 
+def _tomorrow_tag() -> str:
+    return (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
+
+
+def _safe_account_tag(value: str | None) -> str:
+    return _sanitize_filename(value or "账号")
+
+
+def _minutes_floor(value: float) -> int:
+    return max(0, math.floor(value or 0))
+
+
+def _status_tag(status: str | None) -> str:
+    if not status:
+        return ""
+    return f"_{_sanitize_filename(status)}"
+
+
+def _build_part_filename(
+    *,
+    account_name: str | None,
+    part_index: int,
+    attempt: int,
+    minutes: float,
+    ext: str,
+    episode_index: int | None = None,
+    status: str | None = None,
+) -> str:
+    date_tag = _tomorrow_tag()
+    account_tag = _safe_account_tag(account_name)
+    episode_tag = f"第{episode_index}轮_" if episode_index and episode_index > 1 else ""
+    mm = _minutes_floor(minutes)
+    return (
+        f"{date_tag}_{episode_tag}第{part_index}段_候选{attempt:02d}_"
+        f"{mm:02d}min_{account_tag}{_status_tag(status)}.{ext}"
+    )
+
+
+def _build_full_filename(
+    *,
+    account_name: str | None,
+    attempt: int,
+    minutes: float,
+    ext: str,
+    status: str | None = None,
+) -> str:
+    date_tag = _tomorrow_tag()
+    account_tag = _safe_account_tag(account_name)
+    mm = _minutes_floor(minutes)
+    return (
+        f"{date_tag}_完整_候选{attempt:02d}_{mm:02d}min_{account_tag}"
+        f"{_status_tag(status)}.{ext}"
+    )
+
+
+def _build_stitched_filename(
+    *,
+    minutes: float,
+    ext: str,
+    episode_index: int | None = None,
+    account_name: str | None = None,
+    label: str = "成片",
+    status: str | None = None,
+) -> str:
+    date_tag = _tomorrow_tag()
+    mm = _minutes_floor(minutes)
+    episode_tag = f"第{episode_index}版_" if episode_index and episode_index > 1 else ""
+    account_tag = f"_{_safe_account_tag(account_name)}" if account_name else ""
+    label_tag = _sanitize_filename(label)
+    return (
+        f"{date_tag}_{episode_tag}{label_tag}_{mm:02d}min"
+        f"{account_tag}{_status_tag(status)}.{ext}"
+    )
+
+
 def _parse_audio_length(value: str) -> AudioLength:
     match value.strip().lower():
         case "short":
@@ -503,8 +578,12 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                     "or lowering min_duration_minutes"
                 )
 
-            date_tag = (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
-            final_name = f"{date_tag}-{math.floor(merged_minutes):02d}min_{job.id}_{ts}.{output_format}"
+            final_name = _build_stitched_filename(
+                minutes=merged_minutes,
+                ext=output_format,
+                episode_index=episode_index,
+                label="成片",
+            )
             final_path = job.outputs_dir / final_name
             result.output_path.replace(final_path)
             return final_path, merged_minutes
@@ -825,14 +904,25 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                             )
 
                                             if duration.seconds >= split_min_seconds:
-                                                final_name = (
-                                                    f"{_sanitize_filename(account.name)}_ep{episode_index:02d}_"
-                                                    f"p{part.index:02d}_{math.floor(duration_minutes):02d}min_{task_id}.mp4"
+                                                final_name = _build_part_filename(
+                                                    account_name=account.name,
+                                                    part_index=part.index,
+                                                    attempt=attempt,
+                                                    minutes=duration_minutes,
+                                                    ext="mp4",
+                                                    episode_index=episode_index,
                                                 )
                                                 final_path = job.outputs_dir / final_name
                                                 silence_name = (
-                                                    f"{_sanitize_filename(account.name)}_ep{episode_index:02d}_"
-                                                    f"p{part.index:02d}_a{attempt:02d}_silence_{task_id}.mp4"
+                                                    _build_part_filename(
+                                                        account_name=account.name,
+                                                        part_index=part.index,
+                                                        attempt=attempt,
+                                                        minutes=duration_minutes,
+                                                        ext="mp4",
+                                                        episode_index=episode_index,
+                                                        status="静音不合格",
+                                                    )
                                                     if cfg.keep_short_files
                                                     else None
                                                 )
@@ -1729,14 +1819,25 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                     )
 
                                     if duration.seconds >= split_min_seconds:
-                                        final_name = (
-                                            f"{_sanitize_filename(account.name)}_p{part.index:02d}_"
-                                            f"{math.floor(duration_minutes):02d}min_{task_id}.mp4"
+                                        final_name = _build_part_filename(
+                                            account_name=account.name,
+                                            part_index=part.index,
+                                            attempt=attempt,
+                                            minutes=duration_minutes,
+                                            ext="mp4",
+                                            episode_index=episode_index,
                                         )
                                         final_path = job.outputs_dir / final_name
                                         silence_name = (
-                                            f"{_sanitize_filename(account.name)}_p{part.index:02d}_"
-                                            f"a{attempt:02d}_silence_{task_id}.mp4"
+                                            _build_part_filename(
+                                                account_name=account.name,
+                                                part_index=part.index,
+                                                attempt=attempt,
+                                                minutes=duration_minutes,
+                                                ext="mp4",
+                                                episode_index=episode_index,
+                                                status="静音不合格",
+                                            )
                                             if cfg.keep_short_files
                                             else None
                                         )
@@ -2200,10 +2301,12 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 pass
                             return
 
-                        date_tag = (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
-                        final_name = (
-                            f"{date_tag}-{math.floor(merged_minutes):02d}min_"
-                            f"{_sanitize_filename(account.name)}_{job.id}_{ts}.{output_format}"
+                        final_name = _build_stitched_filename(
+                            minutes=merged_minutes,
+                            ext=output_format,
+                            episode_index=episode_index,
+                            account_name=account.name,
+                            label="成片",
                         )
                         final_path = job.outputs_dir / final_name
                         result.output_path.replace(final_path)
@@ -2366,12 +2469,19 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                             silence_name: str | None = None
                             if accepted:
                                 mm = max(0, math.floor(duration_minutes))
-                                final_name = (
-                                    f"{_sanitize_filename(account.name)}_{attempt:02d}_{mm:02d}min_{task_id}.mp4"
+                                final_name = _build_full_filename(
+                                    account_name=account.name,
+                                    attempt=attempt,
+                                    minutes=duration_minutes,
+                                    ext="mp4",
                                 )
                                 if cfg.keep_short_files:
-                                    silence_name = (
-                                        f"{_sanitize_filename(account.name)}_{attempt:02d}_{mm:02d}min_silence_{task_id}.mp4"
+                                    silence_name = _build_full_filename(
+                                        account_name=account.name,
+                                        attempt=attempt,
+                                        minutes=duration_minutes,
+                                        ext="mp4",
+                                        status="静音不合格",
                                     )
                                 silence_ok = await check_silence(
                                     path=tmp_path,
@@ -2402,9 +2512,12 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 elif silence_rejected:
                                     file_name = silence_name or tmp_name
                                 else:
-                                    mm = max(0, math.floor(duration_minutes))
-                                    file_name = (
-                                        f"{_sanitize_filename(account.name)}_{attempt:02d}_{mm:02d}min_short_{task_id}.mp4"
+                                    file_name = _build_full_filename(
+                                        account_name=account.name,
+                                        attempt=attempt,
+                                        minutes=duration_minutes,
+                                        ext="mp4",
+                                        status="时长不足",
                                     )
                                 final_path = job.outputs_dir / file_name
                                 tmp_path.replace(final_path)

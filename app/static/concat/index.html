@@ -5,13 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#0b0b12" />
     <title>早间新闻拼接工作台（本地）</title>
-    <link rel="stylesheet" href="/concat/style.css?v=3" />
+    <link rel="stylesheet" href="/concat/style.css?v=5" />
   </head>
   <body>
     <main class="container">
       <nav class="topNav">
         <a class="navLink" href="/">NotebookLM 生成</a>
         <a class="navLink active" href="/concat">音频拼接</a>
+        <button id="themeToggle" class="navToggle" type="button">切换到亮色</button>
       </nav>
       <header class="hero">
         <div class="hero-top">
@@ -33,6 +34,67 @@
 
       <div class="layout">
         <div class="col">
+          <section class="panel candidatePanel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">候选拼接（早间新闻三段）</div>
+                <div class="panel-desc muted">从生成页选择候选音频 → 拼接成“主体音频”（可反复拼接不同版本）。</div>
+              </div>
+              <div class="pill muted">选择候选</div>
+            </div>
+
+            <section class="grid">
+              <label class="field">
+                <span class="field-label">任务</span>
+                <select id="jobSelect"></select>
+              </label>
+              <label class="field">
+                <span class="field-label">操作</span>
+                <div class="actions compact">
+                  <button id="jobRefresh" class="secondary" type="button">刷新列表</button>
+                  <button id="jobLoad" type="button">加载候选</button>
+                </div>
+              </label>
+              <label class="field field-wide">
+                <span class="field-label">主体输出名（默认自动）</span>
+                <input id="stitchOutputName" type="text" placeholder="例如：20260126-早新闻-主体.m4a" />
+              </label>
+              <label class="field">
+                <span class="field-label">主体格式</span>
+                <select id="stitchOutputFormat">
+                  <option value="m4a" selected>M4A</option>
+                  <option value="mp3">MP3</option>
+                  <option value="mp4">MP4</option>
+                </select>
+              </label>
+            </section>
+
+            <div id="candidateList" class="candidateList"></div>
+            <div id="candidateSelectionSummary" class="candidateSummary"></div>
+
+            <div class="transitionBlock">
+              <div class="panel-title small">过渡音频设置</div>
+              <div class="transitionControls">
+                <label class="toggle">
+                  <input id="transitionEnabled" type="checkbox" />
+                  使用过渡音乐（可做有/无间奏两种版本）
+                </label>
+                <label class="field">
+                  <span class="field-label">淡入淡出（秒）</span>
+                  <input id="transitionFade" type="number" min="0" max="10" step="0.1" value="3" />
+                </label>
+              </div>
+              <div id="transitionList" class="transitionList"></div>
+            </div>
+
+            <div class="actions" style="margin-top:12px">
+              <button id="stitchAutoPick" class="secondary" type="button">每段选最长</button>
+              <button id="stitchPartsBtn" type="button">拼接主体</button>
+            </div>
+
+            <div id="stitchPartsResult" class="result"></div>
+          </section>
+
           <section class="panel">
             <div class="panel-head">
               <div>
@@ -82,6 +144,10 @@
             <div class="drop-meta">
               <button id="multiClear" class="secondary mini" type="button" disabled>清空多段</button>
               <span id="multiHint" class="muted">未添加</span>
+            </div>
+            <div id="importedBox" class="importedBox muted" style="display:none">
+              <span>已导入主音频：<span id="importedName"></span></span>
+              <button id="importedClear" class="secondary mini" type="button">清除导入</button>
             </div>
             <ol id="multiList" class="file-list"></ol>
           </section>
@@ -210,7 +276,7 @@
       </div>
     </main>
 
-    <script src="/concat/app.js?v=3"></script>
+    <script src="/concat/app.js?v=5"></script>
   </body>
 </html>
 

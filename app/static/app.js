@@ -32,6 +32,9 @@ const STORAGE_STITCH_TRANSITION_REPEATS = "notebooklm.stitchTransitionRepeats";
 const STORAGE_STITCH_TRANSITION_DURATIONS = "notebooklm.stitchTransitionDurations";
 const STORAGE_STITCH_TRANSITION_LOCK = "notebooklm.stitchTransitionLock";
 const STORAGE_LAST_RUN_CONFIG = "notebooklm.lastRunConfig";
+const STORAGE_THEME = "notebooklm.uiTheme";
+const THEME_DARK = "dark";
+const THEME_LIGHT = "light";
 const STALL_WARNING_MS = 20 * 60 * 1000;
 const DEFAULT_TRANSITIONS_BY_SEGMENTS = {
   3: [
@@ -42,6 +45,42 @@ const DEFAULT_TRANSITIONS_BY_SEGMENTS = {
 const DEFAULT_TRANSITION_DURATIONS_BY_SEGMENTS = {
   3: [30, 25],
 };
+
+function applyTheme(theme){
+  const root = document.documentElement;
+  const body = document.body;
+  const normalized = theme === THEME_LIGHT ? THEME_LIGHT : THEME_DARK;
+  root.dataset.theme = normalized;
+  if (body) body.dataset.theme = normalized;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta){
+    meta.setAttribute("content", normalized === THEME_LIGHT ? "#f6f1e8" : "#0b0b12");
+  }
+  const btn = document.getElementById("themeToggle");
+  if (btn){
+    btn.textContent = normalized === THEME_LIGHT ? "切换到暗色" : "切换到亮色";
+  }
+  try{
+    localStorage.setItem(STORAGE_THEME, normalized);
+  }catch{}
+}
+
+function initThemeToggle(){
+  const saved = (() => {
+    try{
+      return localStorage.getItem(STORAGE_THEME);
+    }catch{
+      return null;
+    }
+  })();
+  applyTheme(saved || THEME_DARK);
+  const btn = document.getElementById("themeToggle");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    const current = document.documentElement.dataset.theme || THEME_DARK;
+    applyTheme(current === THEME_LIGHT ? THEME_DARK : THEME_LIGHT);
+  });
+}
 
 function persistLastJobId(jobId){
   try{
@@ -117,14 +156,14 @@ function collectLastRunConfig(){
     split_task_timeout_minutes: parseFloat($("#splitTaskTimeout")?.value || "40"),
     split_output_format: $("#splitOutputFormat")?.value || "m4a",
     split_keep_parts: !!$("#splitKeepParts")?.checked,
-    split_manual_stitch: !!$("#splitManualStitch")?.checked,
+    split_manual_stitch: !!$("#splitEnabled")?.checked,
     split_candidates_per_part: _normalizeSplitCandidates(_readSplitCandidates(), segs),
-    stitch_transition_enabled: !!$("#stitchTransitionEnabled")?.checked,
-    stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "3"),
-    stitch_transition_files: _normalizeTransitions(_readTransitions(), segs),
-    stitch_transition_repeats: _normalizeTransitionRepeats(_readTransitionRepeats(), segs),
-    stitch_transition_durations: _normalizeTransitionDurations(_readTransitionDurations(), segs),
-    stitch_transition_lock: !!$("#stitchTransitionLock")?.checked,
+    stitch_transition_enabled: false,
+    stitch_transition_fade_seconds: 3,
+    stitch_transition_files: [],
+    stitch_transition_repeats: [],
+    stitch_transition_durations: [],
+    stitch_transition_lock: false,
     language: $("#lang")?.value || "zh",
     audio_length: $("#audioLength")?.value || "long",
     audio_format: $("#audioFormat")?.value || "deep_dive",
@@ -1152,7 +1191,18 @@ function renderStitchPanel(){
   });
 
   actions.append(btn);
-  box.append(title, hint, grid, actions);
+
+  const transWrap = document.createElement("div");
+  transWrap.className = "stitchTransitionWrap";
+  const transTitle = document.createElement("div");
+  transTitle.className = "stitchTitle";
+  transTitle.textContent = "过渡音频设置（拼接时生效）";
+  const transList = document.createElement("div");
+  transList.className = "transitionList";
+  transWrap.append(transTitle, transList);
+
+  box.append(title, hint, grid, transWrap, actions);
+  renderTransitionList(transList);
 }
 
 function renderJobs(){
@@ -1810,8 +1860,8 @@ function renderSplitPromptList(){
   }
 }
 
-function renderTransitionList(){
-  const box = $("#stitchTransitionList");
+function renderTransitionList(target){
+  const box = (typeof target === "string" ? $(target) : target) || $("#stitchTransitionList");
   if (!box) return;
   const segments = _getSplitSegments();
   const gaps = Math.max(0, segments - 1);
@@ -2954,24 +3004,12 @@ function collectConfig(){
     split_task_timeout_minutes: parseFloat($("#splitTaskTimeout")?.value || "40"),
     split_output_format: $("#splitOutputFormat").value,
     split_keep_parts: $("#splitKeepParts").checked,
-    split_manual_stitch: ($("#splitEnabled").checked && $("#splitManualStitch").checked),
-    stitch_transition_enabled: ($("#splitEnabled").checked && $("#stitchTransitionEnabled")?.checked),
-    stitch_transition_fade_seconds: parseFloat($("#stitchTransitionFade")?.value || "3"),
-    stitch_transition_files: (() => {
-      if (!$("#splitEnabled").checked) return [];
-      const segments = _getSplitSegments();
-      return _normalizeTransitions(_readTransitions(), segments);
-    })(),
-    stitch_transition_repeats: (() => {
-      if (!$("#splitEnabled").checked) return [];
-      const segments = _getSplitSegments();
-      return _normalizeTransitionRepeats(_readTransitionRepeats(), segments);
-    })(),
-    stitch_transition_durations: (() => {
-      if (!$("#splitEnabled").checked) return [];
-      const segments = _getSplitSegments();
-      return _normalizeTransitionDurations(_readTransitionDurations(), segments);
-    })(),
+    split_manual_stitch: $("#splitEnabled").checked,
+    stitch_transition_enabled: false,
+    stitch_transition_fade_seconds: 3,
+    stitch_transition_files: [],
+    stitch_transition_repeats: [],
+    stitch_transition_durations: [],
     split_candidates_per_part: (() => {
       if (!$("#splitEnabled").checked) return [];
       const segments = _getSplitSegments();
@@ -3163,13 +3201,54 @@ function wireDropzone(){
   const picker = $("#filePicker");
   const meta = $("#dropMeta");
 
-  function setFile(file){
+  const docExts = new Set(["pdf", "docx"]);
+  function getExt(name){
+    const idx = String(name || "").lastIndexOf(".");
+    return idx >= 0 ? String(name || "").slice(idx + 1).toLowerCase() : "";
+  }
+  async function parseFileViaBackend(file){
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch("/api/parse-file", { method: "POST", body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data?.ok){
+      throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    }
+    return data;
+  }
+
+  async function setFile(file){
     state.reportFile = file;
     if (!file){
       meta.textContent = "未选择文件";
       return;
     }
     meta.textContent = `${file.name} • ${fmtBytes(file.size)}`;
+
+    const ext = getExt(file.name);
+    if (ext === "doc"){
+      meta.textContent = `${file.name} • ${fmtBytes(file.size)} • 不支持 .doc`;
+      alert("暂不支持 .doc，请先转成 .docx 或 .pdf");
+      state.reportFile = null;
+      return;
+    }
+    if (docExts.has(ext)){
+      meta.textContent = `${file.name} • ${fmtBytes(file.size)} • 解析中…`;
+      try{
+        const data = await parseFileViaBackend(file);
+        $("#reportText").value = String(data.text || "");
+        $("#charCount").textContent = $("#reportText").value.length;
+        meta.textContent = `${file.name} • ${fmtBytes(file.size)} • 已解析`;
+        // Use parsed text instead of uploading binary files
+        state.reportFile = null;
+      }catch(e){
+        meta.textContent = `${file.name} • ${fmtBytes(file.size)} • 解析失败`;
+        alert(`文件解析失败：${e?.message || e}`);
+        state.reportFile = null;
+      }
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = () => {
       $("#reportText").value = String(reader.result || "");
@@ -3353,6 +3432,7 @@ async function cancelBrowserLogin(){
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  initThemeToggle();
   wireRunTabs();
   hydratePrompts();
   await loadFixedPrompt({fallbackToDefault:true});
