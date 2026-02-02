@@ -354,7 +354,30 @@ function fmtBytes(n){
 }
 
 function fmtTs(ts){
-  return String(ts || "").replace("T"," ").replace("Z","").replace(/\.\d+\+00:00$/,"");
+  const raw = String(ts || "").trim();
+  if (!raw) return "-";
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())){
+    return raw.replace("T"," ").replace("Z","").replace(/\.\d+\+00:00$/,"");
+  }
+  const fmt = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  try{
+    const parts = fmt.formatToParts(d);
+    const out = {};
+    for (const p of parts) out[p.type] = p.value;
+    return `${out.year}-${out.month}-${out.day} ${out.hour}:${out.minute}:${out.second}`;
+  }catch{
+    return fmt.format(d);
+  }
 }
 
 function tagFor(type){

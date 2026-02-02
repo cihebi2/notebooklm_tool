@@ -5,7 +5,7 @@ import json
 import re
 import secrets
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -150,7 +150,8 @@ class JobConfig(BaseModel):
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    tz = timezone(timedelta(hours=8))
+    return datetime.now(tz).isoformat()
 
 
 @dataclass
@@ -474,7 +475,9 @@ class JobManager:
                 outputs_dir.mkdir(parents=True, exist_ok=True)
 
                 job_id = job_dir.name
-                created_at_iso = datetime.fromtimestamp(job_dir.stat().st_mtime, tz=timezone.utc).isoformat()
+                created_at_iso = datetime.fromtimestamp(
+                    job_dir.stat().st_mtime, tz=timezone(timedelta(hours=8))
+                ).isoformat()
                 config = JobConfig.model_validate(
                     {
                         "accounts": [{"account_id": "legacy", "max_attempts": 1}],

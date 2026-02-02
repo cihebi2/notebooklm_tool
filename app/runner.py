@@ -22,8 +22,11 @@ if TYPE_CHECKING:
     from .jobs import Job
 
 
+SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(SHANGHAI_TZ).isoformat()
 
 
 def _sanitize_filename(value: str) -> str:
@@ -34,7 +37,7 @@ def _sanitize_filename(value: str) -> str:
 
 
 def _tomorrow_tag() -> str:
-    return (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
+    return (datetime.now(SHANGHAI_TZ) + timedelta(days=1)).strftime("%Y%m%d")
 
 
 def _safe_account_tag(value: str | None) -> str:
@@ -511,7 +514,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             output_format = (
                 split_output_format if split_output_format in {"mp3", "mp4", "m4a"} else "m4a"
             )
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            ts = datetime.now(SHANGHAI_TZ).strftime("%Y%m%d_%H%M%S")
             merged_tmp = job.outputs_dir / f"merged_ep{episode_index:02d}_{job.id}_{ts}.{output_format}"
 
             await publish(
@@ -1613,7 +1616,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                             return
 
                         # A per-account episode id (JS-safe int) for manual stitch selection.
-                        episode_index = int(datetime.now(timezone.utc).timestamp() * 1000)
+                        episode_index = int(datetime.now(SHANGHAI_TZ).timestamp() * 1000)
                         episode_index = episode_index * 1000 + (abs(hash(account.id)) % 1000)
                         total_required = sum(max(0, int(required_by_part.get(i, 0))) for i in enabled_parts)
 
@@ -2228,7 +2231,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                             else "m4a"
                         )
 
-                        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                        ts = datetime.now(SHANGHAI_TZ).strftime("%Y%m%d_%H%M%S")
                         merged_tmp = job.outputs_dir / (
                             f"{_sanitize_filename(account.name)}_merged_{job.id}_{ts}.{output_format}"
                         )

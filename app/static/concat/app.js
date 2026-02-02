@@ -38,6 +38,33 @@ const transitionEnabledEl = document.getElementById('transitionEnabled');
 const transitionFadeEl = document.getElementById('transitionFade');
 const transitionListEl = document.getElementById('transitionList');
 
+function fmtTs(ts){
+  const raw = String(ts || "").trim();
+  if (!raw) return "-";
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())){
+    return raw.replace("T"," ").replace("Z","").replace(/\.\d+\+00:00$/,"");
+  }
+  const fmt = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  try{
+    const parts = fmt.formatToParts(d);
+    const out = {};
+    for (const p of parts) out[p.type] = p.value;
+    return `${out.year}-${out.month}-${out.day} ${out.hour}:${out.minute}:${out.second}`;
+  }catch{
+    return fmt.format(d);
+  }
+}
+
 const importedBox = document.getElementById('importedBox');
 const importedName = document.getElementById('importedName');
 const importedClear = document.getElementById('importedClear');
@@ -567,7 +594,7 @@ async function loadJobsList(){
     for (const j of jobs){
       const opt = document.createElement('option');
       opt.value = j.id;
-      const created = j.created_at ? String(j.created_at).replace('T',' ').slice(0,19) : '';
+      const created = j.created_at ? fmtTs(j.created_at) : '';
       const title = j.config?.split_enabled ? `分段×${j.config?.split_segments || '?'}` : '整段';
       opt.textContent = `${created} · ${title} · ${j.id}`;
       jobSelect.append(opt);

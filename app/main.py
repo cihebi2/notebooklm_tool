@@ -5,7 +5,7 @@ import json
 import subprocess
 import uuid
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -43,9 +43,11 @@ static_dir = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 concat_static_dir = static_dir / "concat"
 
+SHANGHAI_TZ = timezone(timedelta(hours=8))
+
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(SHANGHAI_TZ).isoformat()
 
 
 def _read_prompts() -> dict[str, Any]:
@@ -1035,7 +1037,7 @@ async def concat_stitch_parts(req: ConcatStitchPartsRequest) -> dict[str, Any]:
 
     name = _sanitize_filename(req.output_name or "")
     if not name:
-        name = f"main_{job.id}_{datetime.now():%Y%m%d_%H%M%S}"
+        name = f"main_{job.id}_{datetime.now(SHANGHAI_TZ):%Y%m%d_%H%M%S}"
     if not name.lower().endswith(f".{output_format}"):
         name += f".{output_format}"
     output_path = concat_service.output_dir / name
