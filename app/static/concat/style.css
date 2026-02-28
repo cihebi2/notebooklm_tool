@@ -728,6 +728,33 @@ h1{
   align-items:center;
   gap:10px;
   margin-bottom:8px;
+  flex-wrap:wrap;
+}
+
+.candidateHeadLeft{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-width:0;
+}
+
+.candidateHeadRight{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-width:0;
+}
+
+.candidateUploadHint{
+  max-width:220px;
+  font-size:11px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+
+.candidateUploadInput{
+  display:none;
 }
 
 .candidateItems{

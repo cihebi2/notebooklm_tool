@@ -92,6 +92,24 @@ let candidateSelection = {};
 const waveformCache = new Map();
 const waveformInflight = new Map();
 
+async function uploadManualPartCandidate(jobId, part, file){
+  if (!jobId) throw new Error("缺少任务 ID");
+  if (!file) throw new Error("未选择文件");
+  const fd = new FormData();
+  fd.append("job_id", String(jobId));
+  fd.append("part", String(part));
+  fd.append("file", file);
+  const res = await fetch("/concat/api/stitch-parts/upload", {
+    method: "POST",
+    body: fd,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok){
+    throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+  }
+  return data;
+}
+
 function renderCandidateSummary(){
   if (!candidateSummaryEl) return;
   const segs = Number(candidateSegments || 0);
@@ -610,8 +628,10 @@ async function loadJobsList(){
   }
 }
 
-async function loadCandidatesForJob(jobId){
+async function loadCandidatesForJob(jobId, opts = {}){
   if (!candidateListEl) return;
+  const keepSelection = !!opts?.keepSelection;
+  const prevSelection = keepSelection ? { ...candidateSelection } : {};
   candidateListEl.innerHTML = '<div class="muted">加载候选中…</div>';
   candidateSelection = {};
   candidateSegments = 0;
@@ -620,7 +640,6 @@ async function loadCandidatesForJob(jobId){
     const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
     if (!res.ok) throw new Error(await res.text());
     const job = await res.json();
-    candidateSegments = Number(job?.config?.split_segments || 0);
 
     const evRes = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/event_log?limit=20000`);
     const evData = evRes.ok ? await evRes.json() : {};
@@ -630,13 +649,62 @@ async function loadCandidatesForJob(jobId){
     for (const ev of events){
       if (String(ev?.type || '') !== 'part_accepted') continue;
       const part = Number(ev.part || 0);
-      if (!part) continue;
+      const file = String(ev.file || "").trim();
+      if (!part || !file) continue;
       if (!byPart[part]) byPart[part] = [];
       byPart[part].push({
-        file: ev.file,
+        file,
         duration: Number(ev.duration_minutes || 0),
         account: ev.account_name || ev.account_id || '',
+        manual: false,
       });
+    }
+
+    const manualRes = await fetch(`/concat/api/stitch-parts/manual?job_id=${encodeURIComponent(jobId)}`);
+    const manualData = manualRes.ok ? await manualRes.json().catch(() => ({})) : {};
+    const manualItems = Array.isArray(manualData?.items) ? manualData.items : [];
+    for (const item of manualItems){
+      const part = Number(item?.part || 0);
+      const file = String(item?.file || "").trim();
+      if (!part || !file) continue;
+      if (!byPart[part]) byPart[part] = [];
+      byPart[part].push({
+        file,
+        duration: Number(item?.durationSeconds || 0) / 60,
+        account: "手动上传",
+        manual: true,
+      });
+    }
+
+    for (const key of Object.keys(byPart)){
+      const rows = Array.isArray(byPart[key]) ? byPart[key] : [];
+      const dedup = new Map();
+      for (const row of rows){
+        const file = String(row?.file || "");
+        if (!file || dedup.has(file)) continue;
+        dedup.set(file, row);
+      }
+      byPart[key] = Array.from(dedup.values());
+    }
+
+    const maxPartFromData = Object.keys(byPart)
+      .map((k) => Number(k))
+      .filter((v) => Number.isFinite(v) && v > 0)
+      .reduce((m, v) => Math.max(m, v), 0);
+    candidateSegments = Math.max(Number(job?.config?.split_segments || 0), maxPartFromData);
+
+    for (let i = 1; i <= candidateSegments; i++){
+      const picked = String(prevSelection[i] || "");
+      if (!picked) continue;
+      const exists = (byPart[i] || []).some((item) => String(item?.file || "") === picked);
+      if (exists) candidateSelection[i] = picked;
+    }
+
+    const preferPart = Number(opts?.preferPart || 0);
+    const preferFile = String(opts?.preferFile || "");
+    if (preferPart > 0 && preferFile){
+      const exists = (byPart[preferPart] || []).some((item) => String(item?.file || "") === preferFile);
+      if (exists) candidateSelection[preferPart] = preferFile;
     }
 
     renderCandidates(jobId, byPart, candidateSegments);
@@ -666,7 +734,63 @@ function renderCandidates(jobId, byPart, segments){
 
     const head = document.createElement('div');
     head.className = 'candidateHead';
-    head.innerHTML = `<strong>第 ${i} 段</strong><span class="muted">${items.length} 条候选</span>`;
+    const left = document.createElement('div');
+    left.className = 'candidateHeadLeft';
+    const title = document.createElement('strong');
+    title.textContent = `第 ${i} 段`;
+    const count = document.createElement('span');
+    const manualCount = items.filter((it) => !!it?.manual).length;
+    count.className = 'muted';
+    count.textContent = manualCount > 0 ? `${items.length} 条候选（手动 ${manualCount}）` : `${items.length} 条候选`;
+    left.append(title, count);
+
+    const right = document.createElement('div');
+    right.className = 'candidateHeadRight';
+    const uploadBtn = document.createElement('button');
+    uploadBtn.type = 'button';
+    uploadBtn.className = 'btn secondary mini';
+    uploadBtn.textContent = '上传补位音频';
+    const uploadHint = document.createElement('span');
+    uploadHint.className = 'candidateUploadHint muted';
+    uploadHint.textContent = '';
+    const uploadInput = document.createElement('input');
+    uploadInput.type = 'file';
+    uploadInput.accept = 'audio/*';
+    uploadInput.className = 'candidateUploadInput';
+
+    uploadBtn.addEventListener('click', () => uploadInput.click());
+    uploadInput.addEventListener('change', async () => {
+      const file = uploadInput.files?.[0];
+      uploadInput.value = '';
+      if (!file) return;
+      const oldText = uploadBtn.textContent;
+      uploadBtn.disabled = true;
+      uploadBtn.textContent = '上传中…';
+      uploadHint.textContent = file.name;
+      try{
+        const data = await uploadManualPartCandidate(jobId, i, file);
+        const uploaded = String(data?.file || "").trim();
+        await loadCandidatesForJob(jobId, {
+          keepSelection: true,
+          preferPart: i,
+          preferFile: uploaded,
+        });
+        if (uploaded){
+          setStatus(`第 ${i} 段补位音频已上传：${uploaded}`);
+        } else {
+          setStatus(`第 ${i} 段补位音频上传成功`);
+        }
+      }catch(e){
+        alert(`第 ${i} 段补位音频上传失败：${String(e)}`);
+      }finally{
+        uploadBtn.disabled = false;
+        uploadBtn.textContent = oldText;
+        uploadHint.textContent = '';
+      }
+    });
+
+    right.append(uploadBtn, uploadHint, uploadInput);
+    head.append(left, right);
 
     const list = document.createElement('div');
     list.className = 'candidateItems';
@@ -674,7 +798,7 @@ function renderCandidates(jobId, byPart, segments){
     if (!items.length){
       const empty = document.createElement('div');
       empty.className = 'muted';
-      empty.textContent = '暂无候选（请稍等或回到生成页继续生成）';
+      empty.textContent = '暂无候选，可直接上传补位音频。';
       list.append(empty);
     } else {
       for (const item of items){
@@ -684,6 +808,11 @@ function renderCandidates(jobId, byPart, segments){
         radio.type = 'radio';
         radio.name = `part-${i}`;
         radio.value = item.file;
+        const isSelected = candidateSelection[i] === item.file;
+        if (isSelected) {
+          radio.checked = true;
+          row.classList.add('selected');
+        }
         radio.addEventListener('change', () => {
           if (radio.checked) {
             candidateSelection[i] = item.file;
@@ -699,7 +828,8 @@ function renderCandidates(jobId, byPart, segments){
         const meta = document.createElement('div');
         meta.className = 'candidateMeta';
         const dur = Number.isFinite(item.duration) ? `${item.duration.toFixed(2).replace(/\\.00$/,'')} min` : '-';
-        meta.textContent = `${dur} · ${item.account || ''} · ${item.file}`;
+        const source = item.manual ? '手动上传' : (item.account || '');
+        meta.textContent = `${dur} · ${source} · ${item.file}`;
         const audio = document.createElement('audio');
         audio.className = 'candidateAudio';
         audio.controls = true;

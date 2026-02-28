@@ -1009,6 +1009,105 @@ async def concat_import_output(req: ConcatImportOutputRequest) -> dict[str, Any]
     }
 
 
+@app.get("/concat/api/stitch-parts/manual")
+async def concat_stitch_parts_manual(job_id: str) -> dict[str, Any]:
+    job = job_manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    base = job.outputs_dir.resolve()
+    out: list[dict[str, Any]] = []
+
+    for path in sorted(base.glob("manual_part*_*.*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not path.is_file():
+            continue
+        m = re.match(r"^manual_part(?P<part>\d+)_", path.name)
+        if not m:
+            continue
+        try:
+            part = int(m.group("part"))
+        except Exception:
+            continue
+        if part <= 0:
+            continue
+        try:
+            duration = get_audio_duration(path)
+            duration_seconds = int(round(duration.seconds))
+        except Exception:
+            duration_seconds = 0
+        out.append(
+            {
+                "part": part,
+                "file": path.name,
+                "durationSeconds": duration_seconds,
+                "lastWriteUnixMs": int(path.stat().st_mtime * 1000),
+                "downloadUrl": f"/download/{job.id}/{path.name}",
+            }
+        )
+
+    return {"ok": True, "jobId": job.id, "items": out}
+
+
+@app.post("/concat/api/stitch-parts/upload")
+async def concat_stitch_parts_upload(
+    job_id: str = Form(...),
+    part: str = Form(...),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    job = job_manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="未找到上传文件 file。")
+
+    try:
+        part_n = int(part)
+    except Exception:
+        raise HTTPException(status_code=400, detail="part must be an integer") from None
+    if part_n <= 0:
+        raise HTTPException(status_code=400, detail="part must be >= 1")
+    segments_n = int(getattr(job.config, "split_segments", 0) or 0)
+    if segments_n > 0 and part_n > segments_n:
+        raise HTTPException(status_code=400, detail=f"part out of range: 1..{segments_n}")
+
+    safe_name = _sanitize_filename(file.filename or "")
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in {".mp3", ".m4a", ".mp4", ".wav", ".aac", ".flac", ".ogg", ".opus"}:
+        raise HTTPException(status_code=400, detail="仅支持常见音频文件格式")
+
+    stem = re.sub(r"\s+", "_", Path(safe_name).stem).strip("_") or "audio"
+    if len(stem) > 48:
+        stem = stem[:48]
+    ts = datetime.now(SHANGHAI_TZ).strftime("%Y%m%d_%H%M%S")
+    name = f"manual_part{part_n}_{ts}_{uuid.uuid4().hex[:8]}_{stem}{suffix}"
+    dest = (job.outputs_dir / name).resolve()
+    base = job.outputs_dir.resolve()
+    if not dest.is_relative_to(base):
+        raise HTTPException(status_code=400, detail="invalid upload destination")
+
+    with dest.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+
+    try:
+        duration = get_audio_duration(dest)
+        duration_seconds = int(round(duration.seconds))
+    except Exception:
+        duration_seconds = 0
+
+    return {
+        "ok": True,
+        "jobId": job.id,
+        "part": part_n,
+        "file": dest.name,
+        "durationSeconds": duration_seconds,
+        "downloadUrl": f"/download/{job.id}/{dest.name}",
+    }
+
+
 @app.post("/concat/api/stitch-parts")
 async def concat_stitch_parts(req: ConcatStitchPartsRequest) -> dict[str, Any]:
     job = job_manager.get(req.job_id)
