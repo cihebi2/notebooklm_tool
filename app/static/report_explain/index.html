@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101319" />
+    <title>报告解说工作台</title>
+    <link rel="stylesheet" href="/report-explain/style.css?v=3" />
+  </head>
+  <body data-view="workspace">
+    <main class="container">
+      <nav class="topNav">
+        <a class="navLink" href="/">NotebookLM 生成</a>
+        <a class="navLink" href="/concat">音频拼接</a>
+        <a class="navLink active" href="/report-explain">报告解说</a>
+        <button id="themeToggle" class="navToggle" type="button">切换浅色</button>
+      </nav>
+
+      <header class="hero">
+        <div class="heroCopy">
+          <div class="eyebrow">CODEX EXEC · GPT-5.4 · XHIGH · FULL AUTO</div>
+          <h1>报告解说工作台</h1>
+          <p>
+            拖拽一份报告 PDF，加载你的提示词，后台调用
+            <code>codex exec --full-auto -c model_reasoning_effort="xhigh" -m gpt-5.4</code>
+            自动生成报告解说稿，并排版输出为 PDF。
+          </p>
+        </div>
+        <div class="heroMeta">
+          <div class="metaCard">
+            <span class="metaLabel">默认模型</span>
+            <strong>GPT-5.4</strong>
+          </div>
+          <div class="metaCard">
+            <span class="metaLabel">推理强度</span>
+            <strong>xhigh</strong>
+          </div>
+          <div class="metaCard">
+            <span class="metaLabel">交付结果</span>
+            <strong>Markdown + PDF</strong>
+          </div>
+          <div class="metaCard">
+            <span class="metaLabel">任务缓存</span>
+            <strong>本地持久化</strong>
+          </div>
+          <div class="metaCard">
+            <span class="metaLabel">日志系统</span>
+            <strong>结构化事件 + Raw Log</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="workspaceGrid">
+        <div class="stack">
+          <section class="panel">
+            <div class="panelHead">
+              <div>
+                <div class="panelTitle">上传报告 PDF</div>
+                <div class="panelDesc">当前页面只接收 PDF，上传后先解析正文预览，再启动生成。</div>
+              </div>
+              <div id="fileStats" class="pill">未选择</div>
+            </div>
+
+            <div id="dropzone" class="dropzone" role="button" tabindex="0">
+              <input id="filePicker" type="file" accept=".pdf,application/pdf" hidden />
+              <div class="dropInner">
+                <div class="dropTitle">拖拽 PDF 到这里</div>
+                <div class="dropSub">或点击选择本地报告文件</div>
+              </div>
+            </div>
+
+            <div class="fieldRow">
+              <label class="field">
+                <span class="fieldLabel">输出文件名</span>
+                <input
+                  id="outputName"
+                  type="text"
+                  placeholder="例如：2026 中国消费趋势（报告解说）"
+                />
+              </label>
+              <div class="field compactField">
+                <span class="fieldLabel">操作</span>
+                <button id="clearFileBtn" class="secondary" type="button">清除文件</button>
+              </div>
+            </div>
+
+            <div class="previewBlock">
+              <div class="previewHead">
+                <div class="panelTitle small">正文预览</div>
+                <div class="muted">字符数：<span id="charCount">0</span></div>
+              </div>
+              <textarea
+                id="reportPreview"
+                readonly
+                placeholder="上传 PDF 后，这里会显示提取出的正文预览。"
+              ></textarea>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panelHead">
+              <div>
+                <div class="panelTitle">提示词</div>
+                <div class="panelDesc">默认加载 `报告解说提示词.txt`，你可以修改后再执行。</div>
+              </div>
+              <div class="actions compact">
+                <button id="reloadPromptBtn" class="secondary" type="button">重载默认提示词</button>
+              </div>
+            </div>
+            <textarea id="promptText" class="promptInput" placeholder="提示词加载中…"></textarea>
+          </section>
+        </div>
+
+        <div class="stack">
+          <section class="panel statusPanel">
+            <div class="panelHead">
+              <div>
+                <div class="panelTitle">运行状态</div>
+                <div class="panelDesc">进度条、阶段轨道和结果摘要会持续刷新。</div>
+              </div>
+              <div id="jobStatusPill" class="pill ghost">idle</div>
+            </div>
+
+            <div class="statusGrid">
+              <div class="statusItem">
+                <span>任务 ID</span>
+                <strong id="jobId">-</strong>
+              </div>
+              <div class="statusItem">
+                <span>当前阶段</span>
+                <strong id="jobStage">等待</strong>
+              </div>
+              <div class="statusItem">
+                <span>源文字数</span>
+                <strong id="sourceChars">-</strong>
+              </div>
+              <div class="statusItem">
+                <span>提示词字数</span>
+                <strong id="promptChars">-</strong>
+              </div>
+            </div>
+            <div id="cacheSourceNote" class="cacheSourceNote muted">
+              加载缓存任务后，可以直接重跑，无需重新上传 PDF。
+            </div>
+
+            <div class="progressPanel">
+              <div class="progressHeader">
+                <div id="statusText" class="statusText">等待上传 PDF</div>
+                <div id="progressPercent" class="progressPercent">0%</div>
+              </div>
+              <div class="progressBar">
+                <div id="progressFill" class="progressFill"></div>
+              </div>
+              <div id="stageRail" class="stageRail">
+                <div class="stageNode" data-stage="queued">
+                  <span class="stageDot"></span>
+                  <span class="stageName">任务创建</span>
+                </div>
+                <div class="stageNode" data-stage="running">
+                  <span class="stageDot"></span>
+                  <span class="stageName">Codex 写作</span>
+                </div>
+                <div class="stageNode" data-stage="rendering">
+                  <span class="stageDot"></span>
+                  <span class="stageName">PDF 排版</span>
+                </div>
+                <div class="stageNode" data-stage="succeeded">
+                  <span class="stageDot"></span>
+                  <span class="stageName">结果就绪</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="actions">
+              <button id="startBtn" type="button">开始生成报告解说</button>
+              <button id="rerunJobBtn" class="secondary" type="button">从缓存重跑</button>
+              <button id="openOutputBtn" class="secondary" type="button">打开输出目录</button>
+              <button id="openResultPageBtn" class="secondary" type="button">打开结果页</button>
+            </div>
+
+            <div id="resultBox" class="resultBox">
+              <div class="resultLine muted">暂无任务结果。</div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panelHead">
+              <div>
+                <div class="panelTitle">任务缓存</div>
+                <div class="panelDesc">支持从本地缓存恢复最近任务，也可以直接按任务 ID 加载。</div>
+              </div>
+              <div class="actions compact">
+                <button id="refreshCacheBtn" class="secondary" type="button">刷新缓存</button>
+              </div>
+            </div>
+
+            <div class="cacheLookup">
+              <input id="jobLookupInput" type="text" placeholder="输入任务 ID 后加载缓存" />
+              <button id="loadJobBtn" class="secondary" type="button">加载</button>
+            </div>
+
+            <div id="recentJobs" class="jobCacheList">
+              <div class="muted">缓存任务加载中…</div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel logPanel">
+        <div class="panelHead">
+          <div>
+            <div class="panelTitle">日志系统</div>
+            <div class="panelDesc">上方为结构化事件流，下方为持久化的 `codex_exec.log` 尾部。</div>
+          </div>
+          <div class="actions compact">
+            <button id="refreshLogsBtn" class="secondary" type="button">刷新日志</button>
+          </div>
+        </div>
+
+        <div id="logMeta" class="logMeta">未选择任务</div>
+        <div id="eventFeed" class="eventFeed">
+          <div class="eventEmpty">暂无事件</div>
+        </div>
+        <pre id="logBox" class="logBox">等待任务开始…</pre>
+      </section>
+    </main>
+
+    <script src="/report-explain/app.js?v=3"></script>
+  </body>
+</html>

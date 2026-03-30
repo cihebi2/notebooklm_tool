@@ -18,6 +18,7 @@ from .accounts_store import AccountsStore
 from .concat_service import ConcatService
 from .config import get_paths
 from .jobs import JobConfig, JobManager
+from .report_explain_service import ReportExplainService
 from .utils.audio_concat import concat_audio, concat_audio_with_transitions
 from .utils.audio_duration import get_audio_duration
 from .utils.silence_detect import detect_silence_segments, segments_to_payload
@@ -35,13 +36,16 @@ job_manager = JobManager(paths, accounts_store)
 login_manager = LoginSessionManager(paths.data_dir / "login_sessions")
 prompts_path = paths.data_dir / "prompts.json"
 concat_service = ConcatService(paths)
+report_explain_service = ReportExplainService(paths)
 default_prompts_path = paths.base_dir / "assets" / "prompts.default.json"
+default_report_explain_prompt_path = paths.base_dir / "报告解说提示词.txt"
 
 app = FastAPI(title="Podcast Studio (NotebookLM)")
 
 static_dir = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 concat_static_dir = static_dir / "concat"
+report_explain_static_dir = static_dir / "report_explain"
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 
@@ -725,6 +729,211 @@ async def download_file(job_id: str, filename: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="file not found")
     return FileResponse(path)
+
+
+# =============================================================================
+# Report Explain Tool
+# =============================================================================
+
+
+@app.get("/report-explain", response_class=HTMLResponse)
+@app.get("/report-explain/", response_class=HTMLResponse)
+async def report_explain_index() -> str:
+    path = report_explain_static_dir / "index.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="report explain ui not found")
+    return path.read_text(encoding="utf-8")
+
+
+@app.get("/report-explain/result/{job_id}", response_class=HTMLResponse)
+async def report_explain_result_page(job_id: str) -> str:
+    if not report_explain_service.get_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    path = report_explain_static_dir / "result.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="report explain result ui not found")
+    return path.read_text(encoding="utf-8")
+
+
+@app.get("/report-explain/app.js")
+async def report_explain_app_js() -> FileResponse:
+    path = report_explain_static_dir / "app.js"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="report explain app.js not found")
+    return FileResponse(path, media_type="application/javascript")
+
+
+@app.get("/report-explain/result.js")
+async def report_explain_result_js() -> FileResponse:
+    path = report_explain_static_dir / "result.js"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="report explain result.js not found")
+    return FileResponse(path, media_type="application/javascript")
+
+
+@app.get("/report-explain/style.css")
+async def report_explain_style_css() -> FileResponse:
+    path = report_explain_static_dir / "style.css"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="report explain style.css not found")
+    return FileResponse(path, media_type="text/css")
+
+
+@app.get("/report-explain/api/default-prompt")
+async def report_explain_default_prompt() -> dict[str, Any]:
+    if not default_report_explain_prompt_path.exists():
+        raise HTTPException(status_code=404, detail="default prompt file not found")
+    text = default_report_explain_prompt_path.read_text(encoding="utf-8")
+    return {
+        "ok": True,
+        "promptText": text,
+        "promptPath": str(default_report_explain_prompt_path),
+        "promptChars": len(text),
+    }
+
+
+@app.get("/report-explain/api/jobs")
+async def report_explain_list_jobs(limit: int = 12) -> dict[str, Any]:
+    items = [job.to_summary_dict() for job in report_explain_service.list_jobs(limit=limit)]
+    return {"ok": True, "items": items}
+
+
+@app.post("/report-explain/api/jobs/{job_id}/rerun")
+async def report_explain_rerun_job(
+    job_id: str,
+    prompt_text: str = Form(""),
+    output_name: str = Form(""),
+) -> dict[str, Any]:
+    source_job = report_explain_service.get_job(job_id)
+    if not source_job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    prompt_value = str(prompt_text or "").strip()
+    if prompt_value and len(prompt_value) < 50:
+        raise HTTPException(status_code=400, detail="prompt is too short")
+
+    try:
+        new_job = report_explain_service.rerun_job(
+            job_id,
+            prompt_text=prompt_value or None,
+            output_name=output_name,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e) or "job not found") from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e) or type(e).__name__) from e
+    return new_job.to_public_dict()
+
+
+@app.post("/report-explain/api/jobs")
+async def report_explain_create_job(
+    report_file: UploadFile = File(...),
+    prompt_text: str = Form(""),
+    output_name: str = Form(""),
+) -> dict[str, Any]:
+    if not report_file.filename:
+        raise HTTPException(status_code=400, detail="missing upload file: report_file")
+
+    ext = Path(report_file.filename).suffix.lower()
+    if ext != ".pdf":
+        raise HTTPException(status_code=400, detail="only PDF files are supported")
+
+    data = await report_file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="uploaded PDF is empty")
+
+    try:
+        report_text = extract_text_from_bytes(data, ext)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e) or type(e).__name__) from e
+
+    report_text = report_text.strip()
+    if len(report_text) < 200:
+        raise HTTPException(status_code=400, detail="extracted PDF text is too short (under 200 chars)")
+
+    prompt_value = str(prompt_text or "").strip()
+    if not prompt_value:
+        if not default_report_explain_prompt_path.exists():
+            raise HTTPException(status_code=400, detail="prompt is empty and default prompt file is missing")
+        prompt_value = default_report_explain_prompt_path.read_text(encoding="utf-8").strip()
+    if len(prompt_value) < 50:
+        raise HTTPException(status_code=400, detail="prompt is too short")
+
+    job = report_explain_service.create_job(
+        source_filename=report_file.filename,
+        source_file_bytes=data,
+        source_text=report_text,
+        prompt_text=prompt_value,
+        output_name=output_name,
+    )
+    return job.to_public_dict()
+
+
+@app.get("/report-explain/api/jobs/{job_id}")
+async def report_explain_job_status(job_id: str) -> dict[str, Any]:
+    job = report_explain_service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job.to_public_dict()
+
+
+@app.get("/report-explain/api/jobs/{job_id}/detail")
+async def report_explain_job_detail(job_id: str) -> dict[str, Any]:
+    data = report_explain_service.get_job_detail(job_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="job not found")
+    return data
+
+
+@app.get("/report-explain/api/jobs/{job_id}/logs")
+async def report_explain_job_logs(
+    job_id: str,
+    max_chars: int = 24000,
+    event_limit: int = 60,
+) -> dict[str, Any]:
+    data = report_explain_service.get_job_logs(job_id, max_chars=max_chars, event_limit=event_limit)
+    if not data:
+        raise HTTPException(status_code=404, detail="job not found")
+    return data
+
+
+@app.get("/report-explain/download/{filename}")
+async def report_explain_download(filename: str) -> FileResponse:
+    safe = Path(filename).name
+    path = report_explain_service.output_dir / safe
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="file not found")
+    media_type = "application/pdf" if path.suffix.lower() == ".pdf" else "text/markdown; charset=utf-8"
+    return FileResponse(path, media_type=media_type, filename=safe)
+
+
+@app.get("/report-explain/preview/{filename}")
+async def report_explain_preview(filename: str) -> FileResponse:
+    safe = Path(filename).name
+    path = report_explain_service.output_dir / safe
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="file not found")
+    media_type = "application/pdf" if path.suffix.lower() == ".pdf" else "text/plain; charset=utf-8"
+    return FileResponse(path, media_type=media_type)
+
+
+@app.post("/report-explain/api/open-output")
+async def report_explain_open_output(file: str | None = None) -> dict[str, Any]:
+    try:
+        if file:
+            safe = Path(file).name
+            path = report_explain_service.output_dir / safe
+            if path.exists():
+                subprocess.Popen(["explorer.exe", f"/select,{path}"], shell=False)
+                return {"ok": True}
+        subprocess.Popen(["explorer.exe", str(report_explain_service.output_dir)], shell=False)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 # =============================================================================

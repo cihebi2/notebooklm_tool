@@ -15,6 +15,7 @@
 - 页面实时显示日志与下载列表
 - 分段音频可插入「过渡音频」（可设置淡入淡出、重复次数、时长）
 - 内置独立的拼接页面 `/concat`，支持片头/片尾/片尾曲拼接
+- 内置独立的报告解说页面 `/report-explain`：拖拽 PDF + 编辑提示词 + 调用 `codex exec --full-auto -c model_reasoning_effort="xhigh" -m gpt-5.4` 自动生成解说稿 PDF
 - 主页面「一键导入拼接」：把生成的音频直接送到拼接页并自动开始
 
 ## 安装 & 运行（Windows / PowerShell）
@@ -87,6 +88,13 @@ python -m venv .venv
   - 自定义路径或拖拽上传
   - 设置“重复次数”“目标时长（秒）”“淡入淡出时长”
   - 目标时长超过原音频会自动循环
+
+## 报告解说页面
+
+- 页面地址：`http://127.0.0.1:8000/report-explain`
+- 当前支持拖拽上传 PDF，默认读取根目录 `报告解说提示词.txt`
+- 后台会调用 `codex exec --full-auto -c model_reasoning_effort="xhigh" -m gpt-5.4` 读取解析后的报告正文与提示词，生成 Markdown，并自动排版导出 PDF
+- 产物默认输出到：`data/report_explain_output/`
 
 ## 另一台电脑部署 & 更新
 
