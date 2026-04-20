@@ -82,6 +82,17 @@ def _sanitize_filename(name: str) -> str:
     return safe or "transition_audio"
 
 
+def _form_to_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "on"}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     return (static_dir / "index.html").read_text(encoding="utf-8")
@@ -803,6 +814,7 @@ async def report_explain_rerun_job(
     job_id: str,
     prompt_text: str = Form(""),
     output_name: str = Form(""),
+    export_pdf: str = Form(""),
 ) -> dict[str, Any]:
     source_job = report_explain_service.get_job(job_id)
     if not source_job:
@@ -811,12 +823,14 @@ async def report_explain_rerun_job(
     prompt_value = str(prompt_text or "").strip()
     if prompt_value and len(prompt_value) < 50:
         raise HTTPException(status_code=400, detail="prompt is too short")
+    export_pdf_value = _form_to_bool(export_pdf, source_job.export_pdf)
 
     try:
         new_job = report_explain_service.rerun_job(
             job_id,
             prompt_text=prompt_value or None,
             output_name=output_name,
+            export_pdf=export_pdf_value,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -832,6 +846,7 @@ async def report_explain_create_job(
     report_file: UploadFile = File(...),
     prompt_text: str = Form(""),
     output_name: str = Form(""),
+    export_pdf: str = Form("true"),
 ) -> dict[str, Any]:
     if not report_file.filename:
         raise HTTPException(status_code=400, detail="missing upload file: report_file")
@@ -862,6 +877,7 @@ async def report_explain_create_job(
         prompt_value = default_report_explain_prompt_path.read_text(encoding="utf-8").strip()
     if len(prompt_value) < 50:
         raise HTTPException(status_code=400, detail="prompt is too short")
+    export_pdf_value = _form_to_bool(export_pdf, True)
 
     job = report_explain_service.create_job(
         source_filename=report_file.filename,
@@ -869,6 +885,7 @@ async def report_explain_create_job(
         source_text=report_text,
         prompt_text=prompt_value,
         output_name=output_name,
+        export_pdf=export_pdf_value,
     )
     return job.to_public_dict()
 

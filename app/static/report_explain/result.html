@@ -1,11 +1,11 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#101319" />
     <title>报告解说结果页</title>
-    <link rel="stylesheet" href="/report-explain/style.css?v=3" />
+    <link rel="stylesheet" href="/report-explain/style.css?v=5" />
   </head>
   <body data-view="result">
     <main class="container resultPage">
@@ -14,7 +14,7 @@
         <a class="navLink" href="/concat">音频拼接</a>
         <a class="navLink" href="/report-explain">报告解说</a>
         <a id="backToWorkspace" class="navLink active" href="/report-explain">返回工作台</a>
-        <button id="themeToggle" class="navToggle" type="button">切换浅色</button>
+        <button id="themeToggle" class="navToggle" type="button">切换主题</button>
       </nav>
 
       <header class="hero resultHero">
@@ -24,22 +24,10 @@
           <p id="resultSubtitle">正在加载任务详情…</p>
         </div>
         <div class="heroMeta">
-          <div class="metaCard">
-            <span class="metaLabel">任务状态</span>
-            <strong id="resultStatusLabel">加载中</strong>
-          </div>
-          <div class="metaCard">
-            <span class="metaLabel">创建时间</span>
-            <strong id="resultCreatedAt">-</strong>
-          </div>
-          <div class="metaCard">
-            <span class="metaLabel">完成耗时</span>
-            <strong id="resultDuration">-</strong>
-          </div>
-          <div class="metaCard">
-            <span class="metaLabel">任务 ID</span>
-            <strong id="resultJobId">-</strong>
-          </div>
+          <div class="metaCard"><span class="metaLabel">任务状态</span><strong id="resultStatusLabel">加载中</strong></div>
+          <div class="metaCard"><span class="metaLabel">创建时间</span><strong id="resultCreatedAt">-</strong></div>
+          <div class="metaCard"><span class="metaLabel">完成耗时</span><strong id="resultDuration">-</strong></div>
+          <div class="metaCard"><span class="metaLabel">任务 ID</span><strong id="resultJobId">-</strong></div>
         </div>
       </header>
 
@@ -48,7 +36,7 @@
           <div class="panelHead">
             <div>
               <div class="panelTitle">结果摘要</div>
-              <div class="panelDesc">下载链接、结构化事件、任务元信息集中展示。</div>
+              <div class="panelDesc">根据任务输出模式，显示 Markdown、PDF 或仅文字排版结果。</div>
             </div>
             <div id="resultStatusPill" class="pill ghost">loading</div>
           </div>
@@ -56,82 +44,53 @@
           <div class="resultActions" id="resultActions">
             <button id="downloadPdfBtn" type="button">下载 PDF</button>
             <button id="downloadMdBtn" class="secondary" type="button">下载 Markdown</button>
+            <button id="copyTextBtn" class="secondary" type="button">一键复制文字</button>
             <button id="rerunResultBtn" class="secondary" type="button">按缓存重跑</button>
             <button id="openOutputBtn" class="secondary" type="button">打开输出目录</button>
             <button id="refreshResultBtn" class="secondary" type="button">刷新任务</button>
           </div>
 
           <div class="summaryGrid">
-            <div class="statusItem">
-              <span>源文件</span>
-              <strong id="resultSourceFile">-</strong>
-            </div>
-            <div class="statusItem">
-              <span>输出基名</span>
-              <strong id="resultOutputBase">-</strong>
-            </div>
-            <div class="statusItem">
-              <span>源文字数</span>
-              <strong id="resultSourceChars">-</strong>
-            </div>
-            <div class="statusItem">
-              <span>提示词字数</span>
-              <strong id="resultPromptChars">-</strong>
-            </div>
+            <div class="statusItem"><span>源文件</span><strong id="resultSourceFile">-</strong></div>
+            <div class="statusItem"><span>输出基名</span><strong id="resultOutputBase">-</strong></div>
+            <div class="statusItem"><span>源文字数</span><strong id="resultSourceChars">-</strong></div>
+            <div class="statusItem"><span>提示词字数</span><strong id="resultPromptChars">-</strong></div>
+            <div class="statusItem"><span>输出模式</span><strong id="resultOutputMode">-</strong></div>
           </div>
-          <div id="resultCacheSourceNote" class="cacheSourceNote muted">
-            这个任务支持直接从缓存重跑，无需重新上传 PDF。
-          </div>
+          <div id="resultCacheSourceNote" class="cacheSourceNote muted">这个任务支持直接从缓存重跑，无需重新上传 PDF。</div>
 
           <div class="progressPanel">
             <div class="progressHeader">
               <div id="resultStatusText" class="statusText">正在加载…</div>
               <div id="resultProgressPercent" class="progressPercent">0%</div>
             </div>
-            <div class="progressBar">
-              <div id="resultProgressFill" class="progressFill"></div>
-            </div>
+            <div class="progressBar"><div id="resultProgressFill" class="progressFill"></div></div>
             <div id="resultStageRail" class="stageRail">
-              <div class="stageNode" data-stage="queued">
-                <span class="stageDot"></span>
-                <span class="stageName">任务创建</span>
-              </div>
-              <div class="stageNode" data-stage="running">
-                <span class="stageDot"></span>
-                <span class="stageName">Codex 写作</span>
-              </div>
-              <div class="stageNode" data-stage="rendering">
-                <span class="stageDot"></span>
-                <span class="stageName">PDF 排版</span>
-              </div>
-              <div class="stageNode" data-stage="succeeded">
-                <span class="stageDot"></span>
-                <span class="stageName">结果就绪</span>
-              </div>
+              <div class="stageNode" data-stage="queued"><span class="stageDot"></span><span class="stageName">任务创建</span></div>
+              <div class="stageNode" data-stage="running"><span class="stageDot"></span><span class="stageName">Codex 写作</span></div>
+              <div class="stageNode" data-stage="rendering"><span class="stageDot"></span><span class="stageName">PDF 排版</span></div>
+              <div class="stageNode" data-stage="succeeded"><span class="stageDot"></span><span class="stageName">结果就绪</span></div>
             </div>
           </div>
 
-          <div id="resultEventFeed" class="eventFeed">
-            <div class="eventEmpty">暂无事件</div>
-          </div>
+          <div id="resultEventFeed" class="eventFeed"><div class="eventEmpty">暂无事件</div></div>
         </section>
 
         <section class="panel">
           <div class="panelHead">
             <div>
-              <div class="panelTitle">渲染预览</div>
-              <div class="panelDesc">左侧展示 Markdown 渲染结果，右侧保留 PDF 预览。</div>
+              <div class="panelTitle">排版预览</div>
+              <div class="panelDesc">左侧展示 Markdown 排版结果；当任务启用 PDF 导出时，右侧显示 PDF 预览。</div>
             </div>
           </div>
 
-          <div class="resultPreviewGrid">
-            <article id="markdownRender" class="markdownRender">
-              <div class="eventEmpty">等待加载 Markdown…</div>
-            </article>
-            <div class="pdfFrameWrap">
+          <div id="resultPreviewGrid" class="resultPreviewGrid">
+            <article id="markdownRender" class="markdownRender"><div class="eventEmpty">等待加载 Markdown…</div></article>
+            <div id="pdfFrameWrap" class="pdfFrameWrap">
               <iframe id="pdfFrame" title="报告解说 PDF 预览"></iframe>
             </div>
           </div>
+          <div id="pdfUnavailableNote" class="fieldHint hidden">当前任务关闭了 PDF 导出，仅保留文字排版结果。</div>
         </section>
       </section>
 
@@ -139,7 +98,7 @@
         <div class="panelHead">
           <div>
             <div class="panelTitle">运行日志</div>
-            <div class="panelDesc">这里显示该任务最新的 Raw Log 尾部，便于排查问题。</div>
+            <div class="panelDesc">这里显示当前任务最新的 Raw Log 尾部，便于排查问题。</div>
           </div>
         </div>
         <div id="resultLogMeta" class="logMeta">等待加载日志…</div>
@@ -147,6 +106,6 @@
       </section>
     </main>
 
-    <script src="/report-explain/result.js?v=1"></script>
+    <script src="/report-explain/result.js?v=5"></script>
   </body>
 </html>

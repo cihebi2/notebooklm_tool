@@ -1,11 +1,11 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#101319" />
     <title>报告解说工作台</title>
-    <link rel="stylesheet" href="/report-explain/style.css?v=3" />
+    <link rel="stylesheet" href="/report-explain/style.css?v=5" />
   </head>
   <body data-view="workspace">
     <main class="container">
@@ -13,7 +13,7 @@
         <a class="navLink" href="/">NotebookLM 生成</a>
         <a class="navLink" href="/concat">音频拼接</a>
         <a class="navLink active" href="/report-explain">报告解说</a>
-        <button id="themeToggle" class="navToggle" type="button">切换浅色</button>
+        <button id="themeToggle" class="navToggle" type="button">切换主题</button>
       </nav>
 
       <header class="hero">
@@ -21,9 +21,9 @@
           <div class="eyebrow">CODEX EXEC · GPT-5.4 · XHIGH · FULL AUTO</div>
           <h1>报告解说工作台</h1>
           <p>
-            拖拽一份报告 PDF，加载你的提示词，后台调用
+            现在支持一次上传多份 PDF 并行处理。默认调用
             <code>codex exec --full-auto -c model_reasoning_effort="xhigh" -m gpt-5.4</code>
-            自动生成报告解说稿，并排版输出为 PDF。
+            生成报告解说稿；你也可以关闭 PDF 导出，仅保留排版后的文字结果。
           </p>
         </div>
         <div class="heroMeta">
@@ -36,16 +36,12 @@
             <strong>xhigh</strong>
           </div>
           <div class="metaCard">
-            <span class="metaLabel">交付结果</span>
-            <strong>Markdown + PDF</strong>
+            <span class="metaLabel">并行模式</span>
+            <strong>多文件同时处理</strong>
           </div>
           <div class="metaCard">
-            <span class="metaLabel">任务缓存</span>
-            <strong>本地持久化</strong>
-          </div>
-          <div class="metaCard">
-            <span class="metaLabel">日志系统</span>
-            <strong>结构化事件 + Raw Log</strong>
+            <span class="metaLabel">输出模式</span>
+            <strong>Markdown 或 Markdown + PDF</strong>
           </div>
         </div>
       </header>
@@ -56,31 +52,54 @@
             <div class="panelHead">
               <div>
                 <div class="panelTitle">上传报告 PDF</div>
-                <div class="panelDesc">当前页面只接收 PDF，上传后先解析正文预览，再启动生成。</div>
+                <div class="panelDesc">支持单个或多个 PDF；批量时会并行创建多个任务，预览区域展示第一个文件。</div>
               </div>
               <div id="fileStats" class="pill">未选择</div>
             </div>
 
             <div id="dropzone" class="dropzone" role="button" tabindex="0">
-              <input id="filePicker" type="file" accept=".pdf,application/pdf" hidden />
+              <input id="filePicker" type="file" accept=".pdf,application/pdf" multiple hidden />
               <div class="dropInner">
                 <div class="dropTitle">拖拽 PDF 到这里</div>
-                <div class="dropSub">或点击选择本地报告文件</div>
+                <div class="dropSub">或点击选择一个 / 多个本地报告文件</div>
               </div>
             </div>
 
             <div class="fieldRow">
               <label class="field">
-                <span class="fieldLabel">输出文件名</span>
-                <input
-                  id="outputName"
-                  type="text"
-                  placeholder="例如：2026 中国消费趋势（报告解说）"
-                />
+                <span class="fieldLabel">输出文件名前缀</span>
+                <input id="outputName" type="text" placeholder="单文件直接用这个名字；多文件自动变成 前缀-1、前缀-2" />
               </label>
               <div class="field compactField">
                 <span class="fieldLabel">操作</span>
-                <button id="clearFileBtn" class="secondary" type="button">清除文件</button>
+                <button id="clearFileBtn" class="secondary" type="button">清空文件</button>
+              </div>
+            </div>
+
+            <div class="fieldRow fieldRowWide">
+              <section class="field modeField">
+                <span class="fieldLabel">输出模式</span>
+                <div class="modeToggle" role="radiogroup" aria-label="输出模式">
+                  <label class="modeOption">
+                    <input id="outputModePdf" type="radio" name="outputMode" value="markdown+pdf" checked />
+                    <span>Markdown + PDF</span>
+                  </label>
+                  <label class="modeOption">
+                    <input id="outputModeText" type="radio" name="outputMode" value="markdown" />
+                    <span>仅文字排版</span>
+                  </label>
+                </div>
+                <div class="fieldHint">关闭 PDF 后，结果页只展示排版后的文字内容和 Markdown 下载。</div>
+              </section>
+            </div>
+
+            <div class="previewBlock">
+              <div class="previewHead">
+                <div class="panelTitle small">已选文件</div>
+                <div id="previewCaption" class="muted">未选择文件</div>
+              </div>
+              <div id="selectedFiles" class="selectedFiles">
+                <div class="eventEmpty">暂无待处理文件</div>
               </div>
             </div>
 
@@ -89,11 +108,7 @@
                 <div class="panelTitle small">正文预览</div>
                 <div class="muted">字符数：<span id="charCount">0</span></div>
               </div>
-              <textarea
-                id="reportPreview"
-                readonly
-                placeholder="上传 PDF 后，这里会显示提取出的正文预览。"
-              ></textarea>
+              <textarea id="reportPreview" readonly placeholder="上传 PDF 后，这里会显示第一个文件的正文预览。"></textarea>
             </div>
           </section>
 
@@ -101,7 +116,7 @@
             <div class="panelHead">
               <div>
                 <div class="panelTitle">提示词</div>
-                <div class="panelDesc">默认加载 `报告解说提示词.txt`，你可以修改后再执行。</div>
+                <div class="panelDesc">默认读取项目根目录 `报告解说提示词.txt`，可直接修改后再批量执行。</div>
               </div>
               <div class="actions compact">
                 <button id="reloadPromptBtn" class="secondary" type="button">重载默认提示词</button>
@@ -116,7 +131,7 @@
             <div class="panelHead">
               <div>
                 <div class="panelTitle">运行状态</div>
-                <div class="panelDesc">进度条、阶段轨道和结果摘要会持续刷新。</div>
+                <div class="panelDesc">状态区聚焦当前选中的任务；如果批量启动，会附带显示本次批量创建的全部任务入口。</div>
               </div>
               <div id="jobStatusPill" class="pill ghost">idle</div>
             </div>
@@ -139,9 +154,7 @@
                 <strong id="promptChars">-</strong>
               </div>
             </div>
-            <div id="cacheSourceNote" class="cacheSourceNote muted">
-              加载缓存任务后，可以直接重跑，无需重新上传 PDF。
-            </div>
+            <div id="cacheSourceNote" class="cacheSourceNote muted">加载缓存任务后，可以直接重跑，无需重新上传 PDF。</div>
 
             <div class="progressPanel">
               <div class="progressHeader">
@@ -152,27 +165,17 @@
                 <div id="progressFill" class="progressFill"></div>
               </div>
               <div id="stageRail" class="stageRail">
-                <div class="stageNode" data-stage="queued">
-                  <span class="stageDot"></span>
-                  <span class="stageName">任务创建</span>
-                </div>
-                <div class="stageNode" data-stage="running">
-                  <span class="stageDot"></span>
-                  <span class="stageName">Codex 写作</span>
-                </div>
-                <div class="stageNode" data-stage="rendering">
-                  <span class="stageDot"></span>
-                  <span class="stageName">PDF 排版</span>
-                </div>
-                <div class="stageNode" data-stage="succeeded">
-                  <span class="stageDot"></span>
-                  <span class="stageName">结果就绪</span>
-                </div>
+                <div class="stageNode" data-stage="queued"><span class="stageDot"></span><span class="stageName">任务创建</span></div>
+                <div class="stageNode" data-stage="running"><span class="stageDot"></span><span class="stageName">Codex 写作</span></div>
+                <div class="stageNode" data-stage="rendering"><span class="stageDot"></span><span class="stageName">PDF 排版</span></div>
+                <div class="stageNode" data-stage="succeeded"><span class="stageDot"></span><span class="stageName">结果就绪</span></div>
               </div>
             </div>
 
             <div class="actions">
-              <button id="startBtn" type="button">开始生成报告解说</button>
+              <button id="startBtn" type="button">开始生成</button>
+              <button id="copyMarkdownBtn" class="secondary" type="button">一键复制 Markdown</button>
+              <button id="copyPlainTextBtn" class="secondary" type="button">一键复制纯文本</button>
               <button id="rerunJobBtn" class="secondary" type="button">从缓存重跑</button>
               <button id="openOutputBtn" class="secondary" type="button">打开输出目录</button>
               <button id="openResultPageBtn" class="secondary" type="button">打开结果页</button>
@@ -187,7 +190,7 @@
             <div class="panelHead">
               <div>
                 <div class="panelTitle">任务缓存</div>
-                <div class="panelDesc">支持从本地缓存恢复最近任务，也可以直接按任务 ID 加载。</div>
+                <div class="panelDesc">可以从本地缓存恢复任务；批量任务启动后，也会自动出现在这里。</div>
               </div>
               <div class="actions compact">
                 <button id="refreshCacheBtn" class="secondary" type="button">刷新缓存</button>
@@ -210,7 +213,7 @@
         <div class="panelHead">
           <div>
             <div class="panelTitle">日志系统</div>
-            <div class="panelDesc">上方为结构化事件流，下方为持久化的 `codex_exec.log` 尾部。</div>
+            <div class="panelDesc">上方是结构化事件流，下方是当前任务 `codex_exec.log` 的尾部。</div>
           </div>
           <div class="actions compact">
             <button id="refreshLogsBtn" class="secondary" type="button">刷新日志</button>
@@ -225,6 +228,6 @@
       </section>
     </main>
 
-    <script src="/report-explain/app.js?v=3"></script>
+    <script src="/report-explain/app.js?v=5"></script>
   </body>
 </html>

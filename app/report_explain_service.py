@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import threading
 import uuid
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ SOURCE_PREVIEW_LIMIT = 12000
 MARKDOWN_PREVIEW_LIMIT = 3000
 LOG_TAIL_LIMIT = 6000
 EVENT_DETAIL_LIMIT = 4000
+OUTPUT_BASENAME_LIMIT = 96
 
 STATUS_LABELS = {
     "queued": "任务创建",
@@ -47,6 +49,15 @@ def _sanitize_filename(name: str) -> str:
     for ch in '\\/:*?"<>|':
         safe = safe.replace(ch, "_")
     return safe or "report_explain"
+
+
+def _shorten_basename(name: str, limit: int = OUTPUT_BASENAME_LIMIT) -> str:
+    clean = Path(_sanitize_filename(name)).stem.strip() or "report_explain"
+    if len(clean) <= limit:
+        return clean
+    digest = hashlib.sha1(clean.encode("utf-8")).hexdigest()[:8]
+    keep = max(24, limit - len(digest) - 1)
+    return f"{clean[:keep]}-{digest}"
 
 
 def _read_text(path: Path, *, max_chars: int | None = None, strip: bool = False) -> str:
@@ -81,6 +92,14 @@ def _looks_like_final_markdown(text: str) -> bool:
 def _parse_iso_or_default(value: str | None, fallback: str) -> str:
     text = str(value or "").strip()
     return text or fallback
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -131,6 +150,7 @@ class ReportExplainJob:
     output_markdown_path: Path
     output_pdf_path: Path
     log_path: Path
+    export_pdf: bool = True
     rerun_from_job_id: str | None = None
     error: str | None = None
     completed_at: str | None = None
@@ -138,7 +158,7 @@ class ReportExplainJob:
 
     def to_public_dict(self) -> dict[str, Any]:
         markdown_ready = self.output_markdown_path.exists()
-        pdf_ready = self.output_pdf_path.exists()
+        pdf_ready = self.export_pdf and self.output_pdf_path.exists()
         rerun_ready = self.source_file_path.exists() and self.source_text_path.exists() and self.prompt_path.exists()
         return {
             "ok": True,
@@ -155,6 +175,8 @@ class ReportExplainJob:
             "exitCode": self.exit_code,
             "sourceFilename": self.source_filename,
             "outputBaseName": self.output_basename,
+            "exportPdf": self.export_pdf,
+            "outputMode": "markdown+pdf" if self.export_pdf else "markdown",
             "rerunReady": rerun_ready,
             "rerunFromJobId": self.rerun_from_job_id,
             "promptChars": self.prompt_chars,
@@ -189,10 +211,12 @@ class ReportExplainJob:
             "durationSeconds": _duration_seconds(self.created_at, self.completed_at),
             "sourceFilename": self.source_filename,
             "outputBaseName": self.output_basename,
+            "exportPdf": self.export_pdf,
+            "outputMode": "markdown+pdf" if self.export_pdf else "markdown",
             "rerunReady": rerun_ready,
             "rerunFromJobId": self.rerun_from_job_id,
             "markdownReady": self.output_markdown_path.exists(),
-            "pdfReady": self.output_pdf_path.exists(),
+            "pdfReady": self.export_pdf and self.output_pdf_path.exists(),
             "resultPageUrl": f"/report-explain/result/{self.id}",
         }
 
@@ -289,6 +313,7 @@ class ReportExplainService:
                     "error": job.error,
                     "exit_code": job.exit_code,
                     "output_basename": job.output_basename,
+                    "export_pdf": job.export_pdf,
                     "rerun_from_job_id": job.rerun_from_job_id,
                     "output_markdown": str(job.output_markdown_path),
                     "output_pdf": str(job.output_pdf_path),
@@ -335,6 +360,7 @@ class ReportExplainService:
         status = str(meta.get("status") or "").strip()
         error = str(meta.get("error") or "").strip() or None
         output_basename = str(meta.get("output_basename") or output_markdown_path.stem).strip() or output_markdown_path.stem
+        export_pdf = _to_bool(meta.get("export_pdf"), True)
         rerun_from_job_id = str(meta.get("rerun_from_job_id") or "").strip() or None
 
         exit_code_raw = meta.get("exit_code")
@@ -389,6 +415,7 @@ class ReportExplainService:
             output_markdown_path=output_markdown_path,
             output_pdf_path=output_pdf_path,
             log_path=log_path,
+            export_pdf=export_pdf,
             rerun_from_job_id=rerun_from_job_id,
             error=error,
             completed_at=completed_at,
@@ -403,6 +430,7 @@ class ReportExplainService:
         source_text: str,
         prompt_text: str,
         output_name: str,
+        export_pdf: bool = True,
         rerun_from_job_id: str | None = None,
     ) -> ReportExplainJob:
         job_id = uuid.uuid4().hex
@@ -427,9 +455,10 @@ class ReportExplainService:
         base_name = _sanitize_filename(output_name.strip()) if output_name.strip() else ""
         if not base_name:
             base_name = f"{Path(source_name).stem}（报告解说）"
-        base_name = Path(base_name).stem
-        output_markdown_path = self._unique_output_path(base_name, ".md")
-        output_pdf_path = self._unique_output_path(base_name, ".pdf")
+        base_name = _shorten_basename(Path(base_name).stem)
+        unique_base_name = _shorten_basename(f"{base_name}-{job_id[:8]}")
+        output_markdown_path = self.output_dir / f"{unique_base_name}.md"
+        output_pdf_path = self.output_dir / f"{unique_base_name}.pdf"
 
         now = _now_iso()
         job = ReportExplainJob(
@@ -439,7 +468,7 @@ class ReportExplainService:
             status="queued",
             message="任务已创建，等待启动 Codex。",
             source_filename=source_filename,
-            output_basename=base_name,
+            output_basename=unique_base_name,
             prompt_chars=len(prompt_text),
             source_chars=len(source_text),
             job_dir=job_dir,
@@ -452,6 +481,7 @@ class ReportExplainService:
             output_markdown_path=output_markdown_path,
             output_pdf_path=output_pdf_path,
             log_path=log_path,
+            export_pdf=bool(export_pdf),
             rerun_from_job_id=str(rerun_from_job_id or "").strip() or None,
         )
         with self._lock:
@@ -462,7 +492,7 @@ class ReportExplainService:
             level="info",
             title="任务已创建",
             status="queued",
-            detail=f"源文件：{source_filename}\n目标输出：{base_name}",
+            detail=f"源文件：{source_filename}\n目标输出：{unique_base_name}",
         )
 
         thread = threading.Thread(target=self._run_job, args=(job.id,), daemon=True)
@@ -475,6 +505,7 @@ class ReportExplainService:
         *,
         prompt_text: str | None = None,
         output_name: str = "",
+        export_pdf: bool | None = None,
     ) -> ReportExplainJob:
         source_job = self.get_job(source_job_id)
         if not source_job:
@@ -500,6 +531,7 @@ class ReportExplainService:
             source_text=source_text,
             prompt_text=resolved_prompt,
             output_name=resolved_output_name,
+            export_pdf=source_job.export_pdf if export_pdf is None else export_pdf,
             rerun_from_job_id=source_job_id,
         )
         self._append_event(
@@ -776,6 +808,22 @@ class ReportExplainService:
             if not markdown_text:
                 raise RuntimeError("Codex 产出的 Markdown 为空。")
             job.output_markdown_path.write_text(markdown_text, encoding="utf-8")
+
+            if not job.export_pdf:
+                self._append_event(
+                    job,
+                    level="info",
+                    title="Markdown 文字排版已生成",
+                    status="succeeded",
+                    detail=f"Markdown 文件：{job.output_markdown_path.name}",
+                )
+                self._set_job_state(
+                    job_id,
+                    status="succeeded",
+                    message="文字排版已生成。",
+                    completed=True,
+                )
+                return
 
             self._set_job_state(
                 job_id,

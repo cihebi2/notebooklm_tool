@@ -327,6 +327,10 @@ button:hover,
   margin-top:14px;
 }
 
+.fieldRowWide{
+  grid-template-columns: 1fr;
+}
+
 .field{
   display:flex;
   flex-direction:column;
@@ -340,6 +344,45 @@ button:hover,
 .fieldLabel{
   font-size:12px;
   color: var(--muted);
+}
+
+.fieldHint{
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.modeField{
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255,255,255,0.03);
+  padding: 14px;
+}
+
+.modeToggle{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+}
+
+.modeOption{
+  position: relative;
+  display:inline-flex;
+  align-items:center;
+  gap:10px;
+  min-height: 44px;
+  padding: 0 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.03);
+  cursor:pointer;
+}
+
+.modeOption input{
+  width: 16px;
+  height: 16px;
+  margin: 0;
 }
 
 input,
@@ -367,6 +410,46 @@ textarea{
 
 .previewBlock{
   margin-top:16px;
+}
+
+.selectedFiles{
+  display:grid;
+  gap:10px;
+}
+
+.selectedFileItem{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:14px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.03);
+  padding: 12px 14px;
+  cursor: grab;
+}
+
+.selectedFileActive{
+  border-color: rgba(119,216,255,0.42);
+  background: rgba(119,216,255,0.08);
+}
+
+.selectedFileDragging{
+  opacity: 0.48;
+  cursor: grabbing;
+}
+
+.selectedFileDropTarget{
+  border-color: rgba(255,149,72,0.5);
+  box-shadow: 0 0 0 2px rgba(255,149,72,0.14);
+  background: rgba(255,149,72,0.08);
+}
+
+.selectedFileMeta{
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
 }
 
 .previewHead{
@@ -559,6 +642,8 @@ button:disabled{
 .resultBox{
   margin-top:16px;
   min-height: 112px;
+  max-height: 420px;
+  overflow:auto;
   border-radius: 18px;
   border: 1px dashed var(--line);
   background: rgba(255,255,255,0.02);
@@ -569,8 +654,42 @@ button:disabled{
   line-height: 1.72;
 }
 
+.resultPreviewText{
+  word-break: break-word;
+}
+
 .resultLinks{
   margin-top: 12px;
+}
+
+.compactLinks{
+  margin-top: 10px;
+}
+
+.batchSection{
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--line);
+}
+
+.batchList{
+  display:grid;
+  gap:10px;
+  margin-top: 12px;
+}
+
+.batchCard{
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.03);
+  padding: 12px 14px;
+}
+
+.batchCardHead{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
 }
 
 .cacheLookup{
@@ -751,6 +870,10 @@ button:disabled{
   align-items:start;
 }
 
+.resultPreviewGrid.singleColumn{
+  grid-template-columns: 1fr;
+}
+
 .markdownRender{
   min-height: 520px;
   max-height: 840px;
@@ -807,6 +930,10 @@ button:disabled{
   min-height: 720px;
   border: none;
   background: #fff;
+}
+
+.hidden{
+  display:none !important;
 }
 
 .resultPage .panel + .panel{

@@ -13,14 +13,20 @@ const STAGE_LABELS = {
 };
 
 const state = {
-  file: null,
+  files: [],
   parsedText: "",
+  previewFileName: "",
+  dragIndex: -1,
   jobId: "",
+  currentJobData: null,
   cachedSourceJobId: "",
   pollTimer: null,
+  isSubmitting: false,
   outputNameAuto: true,
   lastAutoName: "",
   recentJobs: [],
+  batchJobs: [],
+  batchErrors: [],
 };
 
 const dropzone = $("#dropzone");
@@ -28,11 +34,17 @@ const filePicker = $("#filePicker");
 const fileStats = $("#fileStats");
 const clearFileBtn = $("#clearFileBtn");
 const outputNameInput = $("#outputName");
+const outputModePdf = $("#outputModePdf");
+const outputModeText = $("#outputModeText");
+const selectedFiles = $("#selectedFiles");
+const previewCaption = $("#previewCaption");
 const reportPreview = $("#reportPreview");
 const charCount = $("#charCount");
 const promptText = $("#promptText");
 const reloadPromptBtn = $("#reloadPromptBtn");
 const startBtn = $("#startBtn");
+const copyMarkdownBtn = $("#copyMarkdownBtn");
+const copyPlainTextBtn = $("#copyPlainTextBtn");
 const rerunJobBtn = $("#rerunJobBtn");
 const openOutputBtn = $("#openOutputBtn");
 const openResultPageBtn = $("#openResultPageBtn");
@@ -57,28 +69,25 @@ const logBox = $("#logBox");
 const recentJobs = $("#recentJobs");
 const themeToggle = $("#themeToggle");
 
-if (openResultPageBtn) openResultPageBtn.disabled = true;
-if (rerunJobBtn) rerunJobBtn.disabled = true;
-
 function readStorage(key){
-  try{
-    return localStorage.getItem(key) || "";
-  }catch(_){
-    return "";
-  }
+  try { return localStorage.getItem(key) || ""; }
+  catch (_) { return ""; }
 }
 
 function writeStorage(key, value){
-  try{
+  try {
     if (value) localStorage.setItem(key, value);
-  }catch(_){}
+  } catch (_) {}
 }
 
 function clearStorage(key){
-  try{
-    localStorage.removeItem(key);
-  }catch(_){}
+  try { localStorage.removeItem(key); }
+  catch (_) {}
 }
+
+function saveLastJobId(jobId){ writeStorage(STORAGE_LAST_JOB, jobId); }
+function readLastJobId(){ return readStorage(STORAGE_LAST_JOB); }
+function clearLastJobId(){ clearStorage(STORAGE_LAST_JOB); }
 
 function escapeHtml(value){
   return String(value ?? "")
@@ -102,6 +111,14 @@ function humanSize(bytes){
 function extOf(name){
   const index = String(name || "").lastIndexOf(".");
   return index >= 0 ? String(name).slice(index).toLowerCase() : "";
+}
+
+function fileStem(name){
+  return String(name || "").replace(/\.pdf$/i, "").trim();
+}
+
+function fileKey(file){
+  return [file.name, file.size, file.lastModified].join("::");
 }
 
 function formatDateTime(value){
@@ -128,16 +145,54 @@ function formatDuration(seconds){
   return `${minutes}m ${remain}s`;
 }
 
-function saveLastJobId(jobId){
-  writeStorage(STORAGE_LAST_JOB, jobId);
+function getExportPdf(){
+  return !!outputModePdf?.checked;
 }
 
-function readLastJobId(){
-  return readStorage(STORAGE_LAST_JOB);
+function outputModeLabel(exportPdf){
+  return exportPdf ? "Markdown + PDF" : "仅文字排版";
 }
 
-function clearLastJobId(){
-  clearStorage(STORAGE_LAST_JOB);
+async function copyText(text){
+  const value = String(text || "").trim();
+  if (!value){
+    throw new Error("没有可复制的 Markdown 内容");
+  }
+  if (navigator.clipboard?.writeText){
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textarea);
+}
+
+function markdownToPlainText(markdown){
+  const text = String(markdown || "");
+  return text
+    .replace(/\r/g, "")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^>\s?/gm, "")
+    .replace(/^---$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function isQueueBusy(){
+  return state.isSubmitting;
+}
+
+function setOutputMode(exportPdf){
+  if (outputModePdf) outputModePdf.checked = !!exportPdf;
+  if (outputModeText) outputModeText.checked = !exportPdf;
 }
 
 function setStatusPill(text, kind = "idle"){
@@ -149,13 +204,24 @@ function setStatusPill(text, kind = "idle"){
 }
 
 function updateActionButtons(){
-  const hasUploadedFile = !!state.file;
+  const fileCount = state.files.length;
   const hasCachedSource = !!state.cachedSourceJobId;
-  if (rerunJobBtn){
-    rerunJobBtn.disabled = !hasCachedSource;
+  const queueBusy = isQueueBusy();
+  if (rerunJobBtn) rerunJobBtn.disabled = queueBusy || !hasCachedSource || fileCount > 0;
+  if (copyMarkdownBtn){
+    copyMarkdownBtn.disabled = !String(state.currentJobData?.markdownText || "").trim();
+  }
+  if (copyPlainTextBtn){
+    copyPlainTextBtn.disabled = !String(state.currentJobData?.markdownText || "").trim();
   }
   if (!startBtn) return;
-  startBtn.textContent = hasUploadedFile ? "开始生成报告解说" : (hasCachedSource ? "基于缓存重新生成" : "开始生成报告解说");
+  startBtn.disabled = queueBusy || (!fileCount && !hasCachedSource);
+  if (fileCount > 0){
+    const modeText = getExportPdf() ? "解说稿" : "文字排版";
+    startBtn.textContent = fileCount > 1 ? `并行生成 ${fileCount} 份${modeText}` : `开始生成${modeText}`;
+    return;
+  }
+  startBtn.textContent = hasCachedSource ? "基于缓存重新生成" : "开始生成";
 }
 
 function setProgressState(data){
@@ -170,10 +236,9 @@ function setProgressState(data){
     });
     return;
   }
+
   let activeStage = status;
-  if (status === "failed"){
-    activeStage = data?.markdownReady ? "rendering" : "running";
-  }
+  if (status === "failed") activeStage = data?.markdownReady ? "rendering" : "running";
   const activeIndex = Math.max(0, STAGES.indexOf(activeStage));
 
   stageRail?.querySelectorAll(".stageNode").forEach((node) => {
@@ -194,47 +259,160 @@ function setProgressState(data){
   });
 }
 
-function renderResultBox(data){
-  const status = String(data?.status || "");
-  if (!data?.jobId){
-    resultBox.innerHTML = '<div class="resultLine muted">暂无任务结果。</div>';
+function renderSelectedFiles(){
+  if (!selectedFiles) return;
+  if (!state.files.length){
+    selectedFiles.innerHTML = '<div class="eventEmpty">暂无待处理文件</div>';
     return;
   }
 
-  if (status === "succeeded"){
-    const pdfButton = data.downloadPdfUrl
-      ? `<a class="actionLink primaryLink" href="${data.downloadPdfUrl}" target="_blank" rel="noreferrer">下载 PDF</a>`
+  selectedFiles.innerHTML = state.files.map((file, index) => `
+    <article class="selectedFileItem${index === 0 ? " selectedFileActive" : ""}" draggable="true" data-index="${index}">
+      <div>
+        <strong>${escapeHtml(file.name)}</strong>
+        <div class="selectedFileMeta">${humanSize(file.size)} · ${index === 0 ? "当前预览" : "待并行处理"}</div>
+      </div>
+      <button class="secondary selectedFileRemove" type="button" data-index="${index}">移除</button>
+    </article>
+  `).join("");
+
+  selectedFiles.querySelectorAll(".selectedFileRemove").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.index || -1);
+      if (index >= 0) removeFileAt(index);
+    });
+  });
+
+  selectedFiles.querySelectorAll(".selectedFileItem").forEach((item) => {
+    item.addEventListener("dragstart", (event) => {
+      state.dragIndex = Number(item.dataset.index || -1);
+      item.classList.add("selectedFileDragging");
+      if (event.dataTransfer){
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", String(state.dragIndex));
+      }
+    });
+
+    item.addEventListener("dragend", () => {
+      state.dragIndex = -1;
+      item.classList.remove("selectedFileDragging");
+      selectedFiles.querySelectorAll(".selectedFileDropTarget").forEach((node) => {
+        node.classList.remove("selectedFileDropTarget");
+      });
+    });
+
+    item.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      if (state.dragIndex < 0) return;
+      item.classList.add("selectedFileDropTarget");
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    });
+
+    item.addEventListener("dragleave", () => {
+      item.classList.remove("selectedFileDropTarget");
+    });
+
+    item.addEventListener("drop", (event) => {
+      event.preventDefault();
+      item.classList.remove("selectedFileDropTarget");
+      const targetIndex = Number(item.dataset.index || -1);
+      if (targetIndex >= 0) reorderFile(state.dragIndex, targetIndex);
+    });
+  });
+}
+
+function reorderFile(fromIndex, toIndex){
+  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return;
+  if (fromIndex >= state.files.length || toIndex >= state.files.length) return;
+  const [moved] = state.files.splice(fromIndex, 1);
+  state.files.splice(toIndex, 0, moved);
+  syncOutputNameFromQueue();
+  renderSelectedFiles();
+  updateActionButtons();
+  parsePreviewForFirstFile(state.files[0]);
+}
+
+function mergeBatchJobsWithRecent(){
+  if (!state.batchJobs.length || !state.recentJobs.length) return;
+  const recentMap = new Map(state.recentJobs.map((item) => [item.jobId, item]));
+  state.batchJobs = state.batchJobs.map((item) => recentMap.get(item.jobId) ? { ...item, ...recentMap.get(item.jobId) } : item);
+}
+
+function renderBatchSummary(){
+  if (state.batchJobs.length <= 1 && !state.batchErrors.length) return "";
+  const cards = state.batchJobs.map((item) => {
+    const statusClass = item.status === "succeeded" ? "ok" : item.status === "failed" ? "error" : "busy";
+    const resultButton = item.resultPageUrl
+      ? `<a class="actionLink secondaryLink" href="${item.resultPageUrl}" target="_blank" rel="noreferrer">打开结果页</a>`
       : "";
-    const mdButton = data.downloadMarkdownUrl
+    return `
+      <article class="batchCard">
+        <div class="batchCardHead">
+          <strong>${escapeHtml(item.outputBaseName || item.sourceFilename || item.jobId)}</strong>
+          <span class="cacheStatus ${statusClass}">${escapeHtml(item.stageLabel || item.status || "-")}</span>
+        </div>
+        <div class="selectedFileMeta">${escapeHtml(item.sourceFilename || "")}</div>
+        <div class="selectedFileMeta">模式：${escapeHtml(outputModeLabel(item.exportPdf !== false))}</div>
+        <div class="resultLinks compactLinks">${resultButton}</div>
+      </article>
+    `;
+  }).join("");
+
+  const errors = state.batchErrors.length
+    ? `<div class="resultLine error">失败 ${state.batchErrors.length} 个：${escapeHtml(state.batchErrors.join("；"))}</div>`
+    : "";
+
+  return `
+    <section class="batchSection">
+      <div class="resultLine"><strong>本次批量任务</strong> · 成功 ${state.batchJobs.length} 个${state.batchErrors.length ? `，失败 ${state.batchErrors.length} 个` : ""}</div>
+      ${errors}
+      <div class="batchList">${cards || '<div class="eventEmpty">暂无成功任务</div>'}</div>
+    </section>
+  `;
+}
+
+function renderResultBox(data){
+  const batchSection = renderBatchSummary();
+  if (!data?.jobId){
+    resultBox.innerHTML = batchSection || '<div class="resultLine muted">暂无任务结果。</div>';
+    return;
+  }
+
+  let summary = "";
+  if (data.status === "succeeded"){
+    const primaryButton = data.downloadPdfUrl
+      ? `<a class="actionLink primaryLink" href="${data.downloadPdfUrl}" target="_blank" rel="noreferrer">下载 PDF</a>`
+      : data.downloadMarkdownUrl
+        ? `<a class="actionLink primaryLink" href="${data.downloadMarkdownUrl}" target="_blank" rel="noreferrer">下载 Markdown</a>`
+        : "";
+    const markdownButton = data.downloadMarkdownUrl && data.downloadPdfUrl
       ? `<a class="actionLink secondaryLink" href="${data.downloadMarkdownUrl}" target="_blank" rel="noreferrer">下载 Markdown</a>`
       : "";
     const resultButton = data.resultPageUrl
       ? `<a class="actionLink secondaryLink" href="${data.resultPageUrl}" target="_blank" rel="noreferrer">打开结果页</a>`
       : "";
     const preview = data.markdownPreview
-      ? `<div class="resultLine">预览：${escapeHtml(String(data.markdownPreview).slice(0, 220)).replace(/\n/g, "<br/>")}</div>`
+      ? `<div class="resultLine resultPreviewText">预览：${escapeHtml(String(data.markdownPreview)).replace(/\n/g, "<br/>")}</div>`
       : "";
-    resultBox.innerHTML = `
-      <div class="resultLine"><strong>输出完成</strong>：${escapeHtml(data.pdfFile || "PDF")}</div>
+    summary = `
+      <div class="resultLine"><strong>当前任务已完成</strong> · ${escapeHtml(outputModeLabel(data.exportPdf !== false))}</div>
       <div class="resultLine muted">完成时间：${escapeHtml(formatDateTime(data.completedAt))} · 总耗时：${escapeHtml(formatDuration(data.durationSeconds))}</div>
-      <div class="resultLinks">${pdfButton}${mdButton}${resultButton}</div>
+      <div class="resultLinks">${primaryButton}${markdownButton}${resultButton}</div>
       ${preview}
     `;
-    return;
-  }
-
-  if (status === "failed"){
-    resultBox.innerHTML = `
+  } else if (data.status === "failed"){
+    summary = `
       <div class="resultLine error">任务失败：${escapeHtml(data.error || data.message || "未知错误")}</div>
-      <div class="resultLine muted">你可以查看下方日志，或从任务缓存中重新加载该任务。</div>
+      <div class="resultLine muted">可以查看日志，也可以从缓存任务重新执行。</div>
     `;
-    return;
+  } else {
+    summary = `
+      <div class="resultLine"><strong>当前任务运行中</strong></div>
+      <div class="resultLine muted">${escapeHtml(data?.message || "正在处理任务…")}</div>
+    `;
   }
 
-  resultBox.innerHTML = `
-    <div class="resultLine"><strong>任务运行中</strong></div>
-    <div class="resultLine muted">${escapeHtml(data?.message || "正在等待 Codex 与 PDF 排版完成。")}</div>
-  `;
+  resultBox.innerHTML = summary + batchSection;
 }
 
 function renderEventFeed(events){
@@ -243,6 +421,7 @@ function renderEventFeed(events){
     eventFeed.innerHTML = '<div class="eventEmpty">暂无事件</div>';
     return;
   }
+
   eventFeed.innerHTML = rows.slice(-10).map((item) => {
     const level = escapeHtml(item.level || "info");
     const title = escapeHtml(item.title || "事件");
@@ -262,8 +441,7 @@ function renderEventFeed(events){
 }
 
 function renderLogs(data){
-  const events = data?.events || [];
-  renderEventFeed(events);
+  renderEventFeed(data?.events || []);
   logMeta.textContent = state.jobId
     ? `任务 ${state.jobId} · 日志大小 ${humanSize(data?.logSize || 0)} · 更新时间 ${formatDateTime(data?.updatedAt)}`
     : "未选择任务";
@@ -272,18 +450,16 @@ function renderLogs(data){
 
 function renderRecentJobs(items){
   state.recentJobs = Array.isArray(items) ? items : [];
+  mergeBatchJobsWithRecent();
   if (!state.recentJobs.length){
     recentJobs.innerHTML = '<div class="eventEmpty">暂无缓存任务</div>';
+    renderResultBox(state.currentJobData || {});
     return;
   }
 
   recentJobs.innerHTML = state.recentJobs.map((item) => {
     const active = item.jobId === state.jobId ? " active" : "";
-    const statusClass = item.status === "succeeded"
-      ? "ok"
-      : item.status === "failed"
-        ? "error"
-        : "busy";
+    const statusClass = item.status === "succeeded" ? "ok" : item.status === "failed" ? "error" : "busy";
     return `
       <button class="cacheItem${active}" type="button" data-job-id="${escapeHtml(item.jobId)}">
         <div class="cacheTitle">${escapeHtml(item.outputBaseName || item.sourceFilename || item.jobId)}</div>
@@ -292,6 +468,7 @@ function renderRecentJobs(items){
           <span>${escapeHtml(formatDateTime(item.updatedAt || item.createdAt))}</span>
         </div>
         <div class="cacheSub">${escapeHtml(item.sourceFilename || "")}</div>
+        <div class="cacheSub">${escapeHtml(outputModeLabel(item.exportPdf !== false))}</div>
       </button>
     `;
   }).join("");
@@ -299,49 +476,57 @@ function renderRecentJobs(items){
   recentJobs.querySelectorAll(".cacheItem").forEach((button) => {
     button.addEventListener("click", async () => {
       const jobId = button.dataset.jobId || "";
-      if (jobId) await loadJob(jobId, { pushQuery: true });
+      if (jobId) await loadJob(jobId, { pushQuery: true, adoptPrompt: true });
     });
   });
+
+  renderResultBox(state.currentJobData || {});
 }
 
-function applyJobToUI(data){
+function applyJobToUI(data, options = {}){
+  const { keepBatch = false, adoptPrompt = false } = options;
+  if (!keepBatch){
+    state.batchJobs = [];
+    state.batchErrors = [];
+  }
+  state.currentJobData = data || null;
   state.jobId = String(data?.jobId || "");
   state.cachedSourceJobId = data?.rerunReady ? state.jobId : "";
-  if (data?.sourceFilename){
-    state.file = null;
-  }
   if (state.jobId) saveLastJobId(state.jobId);
+
   jobIdEl.textContent = state.jobId || "-";
   jobStageEl.textContent = data?.stageLabel || STAGE_LABELS[data?.status] || "-";
   sourceCharsEl.textContent = data?.sourceChars ?? "-";
   promptCharsEl.textContent = data?.promptChars ?? String(promptText.value.length || 0);
-  statusTextEl.textContent = data?.error
-    ? `${data?.message || "任务失败"}：${data.error}`
-    : (data?.message || "等待中");
+  statusTextEl.textContent = data?.error ? `${data?.message || "任务失败"}：${data.error}` : (data?.message || "等待中");
 
-  if (data?.status === "succeeded"){
-    setStatusPill("完成", "ok");
-  } else if (data?.status === "failed"){
-    setStatusPill("失败", "error");
-  } else if (state.jobId){
-    setStatusPill(data?.stageLabel || "运行中", "busy");
-  } else {
-    setStatusPill("idle");
-  }
+  if (typeof data?.exportPdf === "boolean") setOutputMode(data.exportPdf);
+
+  if (data?.status === "succeeded") setStatusPill("完成", "ok");
+  else if (data?.status === "failed") setStatusPill("失败", "error");
+  else if (state.jobId) setStatusPill(data?.stageLabel || "运行中", "busy");
+  else setStatusPill("idle");
 
   setProgressState(data || {});
   renderResultBox(data || {});
+  if (copyMarkdownBtn){
+    copyMarkdownBtn.textContent = "一键复制 Markdown";
+  }
+  if (copyPlainTextBtn){
+    copyPlainTextBtn.textContent = "一键复制纯文本";
+  }
 
-  if (typeof data?.promptText === "string" && data.promptText){
+  if (adoptPrompt && typeof data?.promptText === "string" && data.promptText){
     promptText.value = data.promptText;
     promptCharsEl.textContent = String(promptText.value.length);
   }
-  if (typeof data?.sourcePreview === "string"){
+  if (state.files.length === 0 && typeof data?.sourcePreview === "string"){
     state.parsedText = data.sourcePreview;
+    state.previewFileName = data.sourceFilename || "";
     reportPreview.value = data.sourcePreview;
     charCount.textContent = String(data.sourceChars ?? data.sourcePreview.length);
+    previewCaption.textContent = data.sourceFilename ? `${data.sourceFilename} · 缓存任务预览` : "缓存任务预览";
     fileStats.textContent = data.sourceFilename ? `${data.sourceFilename} · 缓存任务` : "缓存任务";
-    suggestOutputName(data.sourceFilename || "");
     if (data.outputBaseName) outputNameInput.value = data.outputBaseName;
   }
 
@@ -349,7 +534,7 @@ function applyJobToUI(data){
     if (!state.jobId){
       cacheSourceNote.textContent = "加载缓存任务后，可以直接重跑，无需重新上传 PDF。";
     } else if (data?.rerunFromJobId) {
-      cacheSourceNote.textContent = `当前任务可直接从缓存重跑；它由缓存任务 ${data.rerunFromJobId} 派生生成。`;
+      cacheSourceNote.textContent = `当前任务由缓存任务 ${data.rerunFromJobId} 派生生成，可继续直接重跑。`;
     } else if (data?.rerunReady) {
       cacheSourceNote.textContent = `当前任务 ${state.jobId} 已具备缓存重跑条件，无需重新上传 PDF。`;
     } else {
@@ -371,27 +556,19 @@ async function fetchJson(url, options = {}){
   return data;
 }
 
-async function setFile(file){
-  state.file = null;
+async function parsePreviewForFirstFile(file){
   state.parsedText = "";
+  state.previewFileName = "";
   reportPreview.value = "";
   charCount.textContent = "0";
-  updateActionButtons();
-
   if (!file){
-    fileStats.textContent = "未选择";
-    return;
-  }
-  if (extOf(file.name) !== ".pdf"){
-    window.alert("当前页面只支持 PDF 文件。");
-    fileStats.textContent = "格式不支持";
+    previewCaption.textContent = "未选择文件";
     return;
   }
 
-  state.file = file;
-  fileStats.textContent = `${file.name} · ${humanSize(file.size)} · 解析中`;
-  suggestOutputName(file.name);
-  updateActionButtons();
+  previewCaption.textContent = state.files.length > 1
+    ? `批量模式：预览第 1 个文件 ${file.name}`
+    : `当前预览：${file.name}`;
 
   try{
     const fd = new FormData();
@@ -402,22 +579,71 @@ async function setFile(file){
       throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
     }
     state.parsedText = String(data.text || "");
+    state.previewFileName = file.name;
     reportPreview.value = state.parsedText.slice(0, 12000);
     charCount.textContent = String(state.parsedText.length);
-    fileStats.textContent = `${file.name} · ${humanSize(file.size)} · 已解析`;
   }catch(error){
-    state.file = null;
-    state.parsedText = "";
     reportPreview.value = "";
     charCount.textContent = "0";
-    fileStats.textContent = "解析失败";
-    updateActionButtons();
-    window.alert(`PDF 解析失败：${error?.message || error}`);
+    previewCaption.textContent = `正文预览加载失败：${error?.message || error}`;
   }
 }
 
+async function setFiles(files, options = {}){
+  const { append = true } = options;
+  const incoming = Array.from(files || []).filter((file) => extOf(file.name) === ".pdf");
+  if (!incoming.length){
+    state.files = [];
+    state.parsedText = "";
+    state.previewFileName = "";
+    reportPreview.value = "";
+    charCount.textContent = "0";
+    fileStats.textContent = "未选择";
+    renderSelectedFiles();
+    updateActionButtons();
+    previewCaption.textContent = "未选择文件";
+    return;
+  }
+
+  const baseList = append ? state.files.slice() : [];
+  const seen = new Set(baseList.map(fileKey));
+  for (const file of incoming){
+    const key = fileKey(file);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    baseList.push(file);
+  }
+
+  state.files = baseList;
+  const totalSize = state.files.reduce((sum, item) => sum + Number(item.size || 0), 0);
+  fileStats.textContent = state.files.length === 1
+    ? `${state.files[0].name} · ${humanSize(totalSize)}`
+    : `${state.files.length} 个文件 · ${humanSize(totalSize)}`;
+  syncOutputNameFromQueue();
+  renderSelectedFiles();
+  updateActionButtons();
+  await parsePreviewForFirstFile(state.files[0]);
+}
+
+function removeFileAt(index){
+  if (index < 0 || index >= state.files.length) return;
+  state.files.splice(index, 1);
+  if (!state.files.length){
+    setFiles([]);
+    return;
+  }
+  const totalSize = state.files.reduce((sum, item) => sum + Number(item.size || 0), 0);
+  fileStats.textContent = state.files.length === 1
+    ? `${state.files[0].name} · ${humanSize(totalSize)}`
+    : `${state.files.length} 个文件 · ${humanSize(totalSize)}`;
+  syncOutputNameFromQueue();
+  renderSelectedFiles();
+  parsePreviewForFirstFile(state.files[0]);
+  updateActionButtons();
+}
+
 function suggestOutputName(fileName){
-  const base = String(fileName || "").replace(/\.pdf$/i, "").trim();
+  const base = fileStem(fileName);
   const suggested = base ? `${base}（报告解说）` : "";
   if (!suggested) return;
   const current = String(outputNameInput?.value || "").trim();
@@ -428,6 +654,27 @@ function suggestOutputName(fileName){
   }
 }
 
+function syncOutputNameFromQueue(){
+  if (!state.outputNameAuto) return;
+  if (!state.files.length){
+    outputNameInput.value = "";
+    state.lastAutoName = "";
+    return;
+  }
+  suggestOutputName(state.files[0].name);
+}
+
+
+function resolveOutputNameForFile(file, index, total){
+  const prefix = String(outputNameInput.value || "").trim();
+  const safeStem = fileStem(file.name) || `file-${index + 1}`;
+  if (!prefix){
+    return total === 1 ? "" : `${safeStem}（报告解说）`;
+  }
+  if (total === 1) return prefix;
+  return `${prefix}-${index + 1}`;
+}
+
 async function loadDefaultPrompt(){
   const data = await fetchJson("/report-explain/api/default-prompt");
   promptText.value = String(data.promptText || "");
@@ -436,7 +683,7 @@ async function loadDefaultPrompt(){
 
 async function loadRecentJobs(){
   try{
-    const data = await fetchJson("/report-explain/api/jobs?limit=12");
+    const data = await fetchJson("/report-explain/api/jobs?limit=20");
     renderRecentJobs(data.items || []);
   }catch(error){
     recentJobs.innerHTML = `<div class="eventEmpty">缓存任务加载失败：${escapeHtml(error?.message || error)}</div>`;
@@ -459,9 +706,9 @@ async function loadJobLogs(jobId){
 }
 
 async function loadJob(jobId, options = {}){
-  const { pushQuery = false } = options;
+  const { pushQuery = false, keepBatch = false, adoptPrompt = false } = options;
   const data = await fetchJson(`/report-explain/api/jobs/${encodeURIComponent(jobId)}/detail`);
-  applyJobToUI(data);
+  applyJobToUI(data, { keepBatch, adoptPrompt });
   await loadJobLogs(jobId);
   await loadRecentJobs();
 
@@ -473,11 +720,10 @@ async function loadJob(jobId, options = {}){
 
   if (JOB_TERMINAL.has(String(data.status || ""))){
     stopPolling();
-    startBtn.disabled = false;
   } else {
-    startBtn.disabled = true;
     startPolling(jobId);
   }
+  updateActionButtons();
 }
 
 function stopPolling(){
@@ -492,79 +738,122 @@ function startPolling(jobId){
   state.pollTimer = window.setInterval(async () => {
     try{
       const data = await fetchJson(`/report-explain/api/jobs/${encodeURIComponent(jobId)}`);
-      applyJobToUI(data);
+      state.currentJobData = { ...(state.currentJobData || {}), ...data };
+      applyJobToUI(state.currentJobData, { keepBatch: true });
       await loadJobLogs(jobId);
       await loadRecentJobs();
       if (JOB_TERMINAL.has(String(data.status || ""))){
         stopPolling();
-        startBtn.disabled = false;
       }
+      updateActionButtons();
     }catch(error){
       logMeta.textContent = `状态刷新失败：${error?.message || error}`;
     }
   }, 2500);
 }
 
-async function createJob(options = {}){
+async function createSingleJobRequest(file, total, index){
+  const fd = new FormData();
+  fd.append("prompt_text", String(promptText.value || "").trim());
+  fd.append("output_name", resolveOutputNameForFile(file, index, total));
+  fd.append("export_pdf", getExportPdf() ? "true" : "false");
+  fd.append("report_file", file, file.name);
+  return fetchJson("/report-explain/api/jobs", { method: "POST", body: fd });
+}
+
+async function createJobs(options = {}){
   const forceRerun = !!options.forceRerun;
+  if (isQueueBusy()){
+    window.alert("当前队列提交中，请稍后再试。");
+    return;
+  }
   const promptValue = String(promptText.value || "").trim();
   if (promptValue.length < 50){
-    window.alert("Prompt is too short. Please extend it before running.");
+    window.alert("提示词太短，请补充后再执行。");
     return;
   }
 
-  const rerunJobId = !state.file ? String(state.cachedSourceJobId || state.jobId || "").trim() : "";
-  if (!state.file && !rerunJobId){
-    window.alert("Upload a PDF first, or load a cached job before rerunning.");
+  const rerunJobId = state.files.length === 0 ? String(state.cachedSourceJobId || state.jobId || "").trim() : "";
+  if (!state.files.length && !rerunJobId){
+    window.alert("请先上传至少一个 PDF，或先加载一个缓存任务。");
     return;
   }
   if (forceRerun && !rerunJobId){
-    window.alert("No cached job is available for rerun.");
+    window.alert("当前没有可用于重跑的缓存任务。");
     return;
   }
 
+  state.isSubmitting = true;
   startBtn.disabled = true;
   if (rerunJobBtn) rerunJobBtn.disabled = true;
-  const isRerun = forceRerun || (!state.file && !!rerunJobId);
-  setStatusPill(isRerun ? "rerun" : "creating", "busy");
-  statusTextEl.textContent = isRerun ? "Creating a new run from cached source…" : "Uploading PDF and creating job…";
+  setStatusPill(forceRerun ? "重跑中" : "创建中", "busy");
   progressFill.style.width = "8%";
   progressPercentEl.textContent = "8%";
-  resultBox.innerHTML = `<div class="resultLine muted">${isRerun ? "Starting rerun from cached source…" : "Creating task…"}</div>`;
 
-  const fd = new FormData();
-  fd.append("prompt_text", promptValue);
-  fd.append("output_name", String(outputNameInput.value || "").trim());
-
-  let url = "/report-explain/api/jobs";
-  if (isRerun){
-    url = `/report-explain/api/jobs/${encodeURIComponent(rerunJobId)}/rerun`;
-  } else if (state.file){
-    fd.append("report_file", state.file, state.file.name);
+  if (forceRerun || (!state.files.length && rerunJobId)){
+    try{
+      const fd = new FormData();
+      fd.append("prompt_text", promptValue);
+      fd.append("output_name", String(outputNameInput.value || "").trim());
+      fd.append("export_pdf", getExportPdf() ? "true" : "false");
+      const data = await fetchJson(`/report-explain/api/jobs/${encodeURIComponent(rerunJobId)}/rerun`, {
+        method: "POST",
+        body: fd,
+      });
+      state.batchJobs = [data];
+      state.batchErrors = [];
+      applyJobToUI(data, { keepBatch: true });
+      state.isSubmitting = false;
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set("job", String(data.jobId || ""));
+      history.replaceState({}, "", nextUrl.toString());
+      await loadJobLogs(String(data.jobId || ""));
+      await loadRecentJobs();
+      startPolling(String(data.jobId || ""));
+    }catch(error){
+      state.isSubmitting = false;
+      startBtn.disabled = false;
+      updateActionButtons();
+      setStatusPill("失败", "error");
+      statusTextEl.textContent = `重跑失败：${error?.message || error}`;
+      progressFill.style.width = "0%";
+      progressPercentEl.textContent = "0%";
+      resultBox.innerHTML = `<div class="resultLine error">重跑失败：${escapeHtml(error?.message || error)}</div>`;
+    }
+    return;
   }
 
-  try{
-    const res = await fetch(url, { method: "POST", body: fd });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data?.ok){
-      throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
-    }
-    applyJobToUI(data);
-    const nextUrl = new URL(window.location.href);
-    nextUrl.searchParams.set("job", String(data.jobId || ""));
-    history.replaceState({}, "", nextUrl.toString());
-    await loadJobLogs(String(data.jobId || ""));
-    await loadRecentJobs();
-    startPolling(String(data.jobId || ""));
-  }catch(error){
+  const total = state.files.length;
+  state.batchJobs = [];
+  state.batchErrors = [];
+  statusTextEl.textContent = total > 1 ? `正在并行创建 ${total} 个任务…` : "正在创建任务…";
+  resultBox.innerHTML = `<div class="resultLine muted">${total > 1 ? `正在并行创建 ${total} 个任务…` : "正在创建任务…"}</div>`;
+
+  const results = await Promise.allSettled(state.files.map((file, index) => createSingleJobRequest(file, total, index)));
+  state.batchJobs = results.filter((item) => item.status === "fulfilled").map((item) => item.value);
+  state.batchErrors = results.filter((item) => item.status === "rejected").map((item) => item.reason?.message || String(item.reason || "未知错误"));
+
+  if (!state.batchJobs.length){
+    state.isSubmitting = false;
     startBtn.disabled = false;
     updateActionButtons();
-    setStatusPill("failed", "error");
-    statusTextEl.textContent = `Failed to create task: ${error?.message || error}`;
+    setStatusPill("失败", "error");
+    statusTextEl.textContent = "批量任务创建失败。";
     progressFill.style.width = "0%";
     progressPercentEl.textContent = "0%";
-    resultBox.innerHTML = `<div class="resultLine error">Failed to create task: ${escapeHtml(error?.message || error)}</div>`;
+    renderResultBox({});
+    return;
   }
+
+  const active = state.batchJobs[0];
+  applyJobToUI(active, { keepBatch: true });
+  state.isSubmitting = false;
+  const nextUrl = new URL(window.location.href);
+  nextUrl.searchParams.set("job", String(active.jobId || ""));
+  history.replaceState({}, "", nextUrl.toString());
+  await loadJobLogs(String(active.jobId || ""));
+  await loadRecentJobs();
+  startPolling(String(active.jobId || ""));
 }
 
 function wireTheme(){
@@ -583,7 +872,9 @@ function wireTheme(){
 }
 
 function wireDropzone(){
-  dropzone.addEventListener("click", () => filePicker.click());
+  dropzone.addEventListener("click", () => {
+    filePicker.click();
+  });
   dropzone.addEventListener("dragover", (event) => {
     event.preventDefault();
     dropzone.classList.add("dragover");
@@ -594,24 +885,24 @@ function wireDropzone(){
   dropzone.addEventListener("drop", (event) => {
     event.preventDefault();
     dropzone.classList.remove("dragover");
-    const file = event.dataTransfer?.files?.[0];
-    if (file) setFile(file);
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (files.length) setFiles(files, { append: true });
   });
   filePicker.addEventListener("change", () => {
-    const file = filePicker.files?.[0];
-    if (file) setFile(file);
+    const files = Array.from(filePicker.files || []);
+    if (files.length) setFiles(files, { append: true });
     filePicker.value = "";
   });
 }
 
 async function hydrateInitialJob(){
   const params = new URLSearchParams(window.location.search);
-  const jobId = params.get("job") || readLastJobId();
+  const jobId = params.get("job");
   if (!jobId) return;
   try{
-    await loadJob(jobId, { pushQuery: !!params.get("job") });
+    await loadJob(jobId, { pushQuery: !!params.get("job"), adoptPrompt: false });
   }catch(_){
-    clearLastJobId();
+    if (params.get("job")) clearLastJobId();
   }
 }
 
@@ -622,34 +913,34 @@ outputNameInput?.addEventListener("input", () => {
     state.lastAutoName = "";
     return;
   }
-  if (value !== state.lastAutoName){
-    state.outputNameAuto = false;
-  }
+  if (value !== state.lastAutoName) state.outputNameAuto = false;
 });
 
 clearFileBtn?.addEventListener("click", () => {
-  state.file = null;
+  state.files = [];
   state.parsedText = "";
+  state.previewFileName = "";
   reportPreview.value = "";
   charCount.textContent = "0";
-  fileStats.textContent = "No file selected";
+  previewCaption.textContent = "未选择文件";
+  fileStats.textContent = "未选择";
+  renderSelectedFiles();
   updateActionButtons();
 });
 
 reloadPromptBtn?.addEventListener("click", async () => {
-  try{
-    await loadDefaultPrompt();
-  }catch(error){
-    window.alert(`默认提示词加载失败：${error?.message || error}`);
-  }
+  try { await loadDefaultPrompt(); }
+  catch (error) { window.alert(`默认提示词加载失败：${error?.message || error}`); }
 });
 
 promptText?.addEventListener("input", () => {
   promptCharsEl.textContent = String(promptText.value.length);
 });
 
-startBtn?.addEventListener("click", createJob);
-rerunJobBtn?.addEventListener("click", () => createJob({ forceRerun: true }));
+outputModePdf?.addEventListener("change", updateActionButtons);
+outputModeText?.addEventListener("change", updateActionButtons);
+startBtn?.addEventListener("click", createJobs);
+rerunJobBtn?.addEventListener("click", () => createJobs({ forceRerun: true }));
 
 openOutputBtn?.addEventListener("click", async () => {
   try{
@@ -661,21 +952,51 @@ openOutputBtn?.addEventListener("click", async () => {
 
 openResultPageBtn?.addEventListener("click", () => {
   const href = openResultPageBtn.dataset.href || "";
-  if (href){
-    window.open(href, "_blank", "noopener");
+  if (href) window.open(href, "_blank", "noopener");
+});
+
+copyMarkdownBtn?.addEventListener("click", async () => {
+  try{
+    copyMarkdownBtn.disabled = true;
+    await copyText(state.currentJobData?.markdownText || "");
+    copyMarkdownBtn.textContent = "已复制";
+    window.setTimeout(() => {
+      if (copyMarkdownBtn){
+        copyMarkdownBtn.textContent = "一键复制 Markdown";
+        copyMarkdownBtn.disabled = !String(state.currentJobData?.markdownText || "").trim();
+      }
+    }, 1500);
+  }catch(error){
+    copyMarkdownBtn.textContent = "一键复制 Markdown";
+    copyMarkdownBtn.disabled = !String(state.currentJobData?.markdownText || "").trim();
+    window.alert(`复制失败：${error?.message || error}`);
+  }
+});
+
+copyPlainTextBtn?.addEventListener("click", async () => {
+  try{
+    copyPlainTextBtn.disabled = true;
+    await copyText(markdownToPlainText(state.currentJobData?.markdownText || ""));
+    copyPlainTextBtn.textContent = "已复制";
+    window.setTimeout(() => {
+      if (copyPlainTextBtn){
+        copyPlainTextBtn.textContent = "一键复制纯文本";
+        copyPlainTextBtn.disabled = !String(state.currentJobData?.markdownText || "").trim();
+      }
+    }, 1500);
+  }catch(error){
+    copyPlainTextBtn.textContent = "一键复制纯文本";
+    copyPlainTextBtn.disabled = !String(state.currentJobData?.markdownText || "").trim();
+    window.alert(`复制失败：${error?.message || error}`);
   }
 });
 
 refreshCacheBtn?.addEventListener("click", loadRecentJobs);
-
 loadJobBtn?.addEventListener("click", async () => {
   const jobId = String(jobLookupInput.value || "").trim();
   if (!jobId) return;
-  try{
-    await loadJob(jobId, { pushQuery: true });
-  }catch(error){
-    window.alert(`加载缓存失败：${error?.message || error}`);
-  }
+  try { await loadJob(jobId, { pushQuery: true, adoptPrompt: true }); }
+  catch (error) { window.alert(`加载缓存失败：${error?.message || error}`); }
 });
 
 refreshLogsBtn?.addEventListener("click", async () => {
@@ -684,9 +1005,12 @@ refreshLogsBtn?.addEventListener("click", async () => {
 
 wireTheme();
 wireDropzone();
+renderSelectedFiles();
 updateActionButtons();
+
 loadDefaultPrompt().catch((error) => {
   promptText.value = "";
   logBox.textContent = `默认提示词加载失败：${error?.message || error}`;
 });
+
 loadRecentJobs().then(hydrateInitialJob);

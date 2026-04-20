@@ -28,6 +28,7 @@ const resultSourceFile = $("#resultSourceFile");
 const resultOutputBase = $("#resultOutputBase");
 const resultSourceChars = $("#resultSourceChars");
 const resultPromptChars = $("#resultPromptChars");
+const resultOutputMode = $("#resultOutputMode");
 const resultCacheSourceNote = $("#resultCacheSourceNote");
 const resultStatusText = $("#resultStatusText");
 const resultProgressPercent = $("#resultProgressPercent");
@@ -35,33 +36,30 @@ const resultProgressFill = $("#resultProgressFill");
 const resultStageRail = $("#resultStageRail");
 const resultEventFeed = $("#resultEventFeed");
 const markdownRender = $("#markdownRender");
+const resultPreviewGrid = $("#resultPreviewGrid");
+const pdfFrameWrap = $("#pdfFrameWrap");
 const pdfFrame = $("#pdfFrame");
+const pdfUnavailableNote = $("#pdfUnavailableNote");
 const resultLogMeta = $("#resultLogMeta");
 const resultLogBox = $("#resultLogBox");
 const downloadPdfBtn = $("#downloadPdfBtn");
 const downloadMdBtn = $("#downloadMdBtn");
+const copyTextBtn = $("#copyTextBtn");
 const rerunResultBtn = $("#rerunResultBtn");
 const openOutputBtn = $("#openOutputBtn");
 const refreshResultBtn = $("#refreshResultBtn");
 const backToWorkspace = $("#backToWorkspace");
 const themeToggle = $("#themeToggle");
 
-if (downloadPdfBtn) downloadPdfBtn.disabled = true;
-if (downloadMdBtn) downloadMdBtn.disabled = true;
-if (rerunResultBtn) rerunResultBtn.disabled = true;
-
 function readStorage(key){
-  try{
-    return localStorage.getItem(key) || "";
-  }catch(_){
-    return "";
-  }
+  try { return localStorage.getItem(key) || ""; }
+  catch (_) { return ""; }
 }
 
 function writeStorage(key, value){
-  try{
+  try {
     if (value) localStorage.setItem(key, value);
-  }catch(_){}
+  } catch (_) {}
 }
 
 function escapeHtml(value){
@@ -96,6 +94,10 @@ function formatDuration(seconds){
   return `${minutes}m ${remain}s`;
 }
 
+function outputModeLabel(exportPdf){
+  return exportPdf ? "Markdown + PDF" : "仅文字排版";
+}
+
 async function fetchJson(url, options = {}){
   const res = await fetch(url, options);
   const data = await res.json().catch(() => ({}));
@@ -103,6 +105,26 @@ async function fetchJson(url, options = {}){
     throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
   }
   return data;
+}
+
+async function copyText(text){
+  const value = String(text || "").trim();
+  if (!value){
+    throw new Error("没有可复制的文字内容");
+  }
+  if (navigator.clipboard?.writeText){
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textarea);
 }
 
 function setStatusPill(text, kind = "idle"){
@@ -120,15 +142,12 @@ function setProgressState(data){
 
   const status = String(data?.status || "");
   if (!status){
-    resultStageRail?.querySelectorAll(".stageNode").forEach((node) => {
-      node.classList.remove("done", "active", "error");
-    });
+    resultStageRail?.querySelectorAll(".stageNode").forEach((node) => node.classList.remove("done", "active", "error"));
     return;
   }
+
   let activeStage = status;
-  if (status === "failed"){
-    activeStage = data?.markdownReady ? "rendering" : "running";
-  }
+  if (status === "failed") activeStage = data?.markdownReady ? "rendering" : "running";
   const activeIndex = Math.max(0, STAGES.indexOf(activeStage));
 
   resultStageRail?.querySelectorAll(".stageNode").forEach((node) => {
@@ -193,7 +212,6 @@ function renderMarkdown(markdownText){
   for (let index = 0; index < lines.length; index += 1){
     const raw = lines[index] || "";
     const trimmed = raw.trim();
-
     if (!trimmed){
       flushParagraph();
       continue;
@@ -247,21 +265,20 @@ function applyData(data){
   resultOutputBase.textContent = data.outputBaseName || "-";
   resultSourceChars.textContent = data.sourceChars ?? "-";
   resultPromptChars.textContent = data.promptChars ?? "-";
-  resultStatusText.textContent = data.error
-    ? `${data.message || "任务失败"}：${data.error}`
-    : (data.message || "等待中");
-  if (resultCacheSourceNote){
-    if (data?.rerunFromJobId){
-      resultCacheSourceNote.textContent = `当前结果由缓存任务 ${data.rerunFromJobId} 直接重跑生成；再次执行时也无需重新上传 PDF。`;
-    } else if (data?.rerunReady && data?.jobId){
-      resultCacheSourceNote.textContent = `当前任务 ${data.jobId} 已具备缓存重跑条件，无需重新上传 PDF。`;
-    } else {
-      resultCacheSourceNote.textContent = "当前任务未记录可用的缓存重跑来源。";
-    }
+  resultOutputMode.textContent = outputModeLabel(data.exportPdf !== false);
+  resultStatusText.textContent = data.error ? `${data.message || "任务失败"}：${data.error}` : (data.message || "等待中");
+
+  if (data?.rerunFromJobId){
+    resultCacheSourceNote.textContent = `当前结果由缓存任务 ${data.rerunFromJobId} 直接重跑生成；再次执行时也无需重新上传 PDF。`;
+  } else if (data?.rerunReady && data?.jobId){
+    resultCacheSourceNote.textContent = `当前任务 ${data.jobId} 已具备缓存重跑条件，无需重新上传 PDF。`;
+  } else {
+    resultCacheSourceNote.textContent = "当前任务未记录可用的缓存重跑来源。";
   }
-  if (rerunResultBtn){
-    rerunResultBtn.disabled = !data.rerunReady;
-  }
+
+  rerunResultBtn.disabled = !data.rerunReady;
+  copyTextBtn.disabled = !String(data.markdownText || "").trim();
+  copyTextBtn.textContent = "一键复制文字";
 
   if (data.status === "succeeded") setStatusPill("完成", "ok");
   else if (data.status === "failed") setStatusPill("失败", "error");
@@ -274,10 +291,16 @@ function applyData(data){
     downloadPdfBtn.disabled = false;
     downloadPdfBtn.dataset.href = data.downloadPdfUrl;
     pdfFrame.src = data.previewPdfUrl || data.downloadPdfUrl;
+    pdfFrameWrap.classList.remove("hidden");
+    pdfUnavailableNote.classList.add("hidden");
+    resultPreviewGrid.classList.remove("singleColumn");
   } else {
     downloadPdfBtn.disabled = true;
     downloadPdfBtn.dataset.href = "";
     pdfFrame.removeAttribute("src");
+    pdfFrameWrap.classList.add("hidden");
+    pdfUnavailableNote.classList.remove("hidden");
+    resultPreviewGrid.classList.add("singleColumn");
   }
 
   if (data.downloadMarkdownUrl){
@@ -331,11 +354,6 @@ function wireTheme(){
   });
 }
 
-function getJobIdFromPath(){
-  const parts = window.location.pathname.split("/").filter(Boolean);
-  return parts[parts.length - 1] || "";
-}
-
 downloadPdfBtn?.addEventListener("click", () => {
   const href = downloadPdfBtn.dataset.href || "";
   if (href) window.open(href, "_blank", "noopener");
@@ -344,6 +362,22 @@ downloadPdfBtn?.addEventListener("click", () => {
 downloadMdBtn?.addEventListener("click", () => {
   const href = downloadMdBtn.dataset.href || "";
   if (href) window.open(href, "_blank", "noopener");
+});
+
+copyTextBtn?.addEventListener("click", async () => {
+  try{
+    copyTextBtn.disabled = true;
+    await copyText(state.currentData?.markdownText || "");
+    copyTextBtn.textContent = "已复制";
+    window.setTimeout(() => {
+      copyTextBtn.textContent = "一键复制文字";
+      copyTextBtn.disabled = !String(state.currentData?.markdownText || "").trim();
+    }, 1500);
+  }catch(error){
+    copyTextBtn.textContent = "一键复制文字";
+    copyTextBtn.disabled = !String(state.currentData?.markdownText || "").trim();
+    window.alert(`复制失败：${error?.message || error}`);
+  }
 });
 
 openOutputBtn?.addEventListener("click", async () => {
@@ -358,23 +392,20 @@ rerunResultBtn?.addEventListener("click", async () => {
   rerunResultBtn.disabled = true;
   try{
     const fd = new FormData();
-    const data = await fetchJson(`/report-explain/api/jobs/${encodeURIComponent(state.jobId)}/rerun`, {
-      method: "POST",
-      body: fd,
-    });
+    fd.append("export_pdf", state.currentData?.exportPdf === false ? "false" : "true");
+    const data = await fetchJson(`/report-explain/api/jobs/${encodeURIComponent(state.jobId)}/rerun`, { method: "POST", body: fd });
     const href = data?.resultPageUrl || `/report-explain/result/${encodeURIComponent(data?.jobId || "")}`;
     window.location.href = href;
   }catch(error){
     rerunResultBtn.disabled = false;
-    window.alert(`Failed to rerun cached job: ${error?.message || error}`);
+    window.alert(`缓存重跑失败：${error?.message || error}`);
   }
 });
 
 refreshResultBtn?.addEventListener("click", refreshPage);
 
 wireTheme();
-
-state.jobId = getJobIdFromPath();
+state.jobId = decodeURIComponent(window.location.pathname.split("/").pop() || "").trim();
 if (!state.jobId){
   resultSubtitle.textContent = "未识别到任务 ID。";
   resultLogBox.textContent = "无法加载任务。";
@@ -387,6 +418,6 @@ if (!state.jobId){
     })
     .catch((error) => {
       resultSubtitle.textContent = `任务加载失败：${error?.message || error}`;
-      resultLogBox.textContent = "";
+      resultLogBox.textContent = "无法加载任务日志。";
     });
 }
