@@ -402,9 +402,13 @@ a.btn{text-decoration:none}
   padding:12px 12px;
   background: rgba(0,0,0,.16);
   display:grid;
-  grid-template-columns: 22px 1fr 140px 36px 36px;
+  grid-template-columns: 22px 1fr 128px 120px 36px 36px;
   align-items:center;
   gap:10px;
+}
+.account.hasIssue{
+  border-color: rgba(255,77,109,.34);
+  background: linear-gradient(135deg, rgba(255,77,109,.10), rgba(0,0,0,.16));
 }
 .account .name{
   display:flex;
@@ -413,6 +417,20 @@ a.btn{text-decoration:none}
 }
 .account .name strong{font-weight:800}
 .account .name small{color:var(--muted); font-size:12px}
+.accountHealth{
+  border-radius:999px;
+  border:1px solid var(--stroke);
+  padding:6px 9px;
+  font-size:11px;
+  color:var(--muted);
+  text-align:center;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.accountHealth.good{border-color: rgba(60,247,166,.35); color: rgba(60,247,166,.95); background: rgba(60,247,166,.10)}
+.accountHealth.bad{border-color: rgba(255,77,109,.35); color: rgba(255,77,109,.95); background: rgba(255,77,109,.10)}
+.accountHealth.warn,.accountHealth.checking{border-color: rgba(255,204,102,.35); color: rgba(255,204,102,.95); background: rgba(255,204,102,.10)}
 .miniInput{
   width:100%;
   background: rgba(0,0,0,.22);
@@ -928,4 +946,14 @@ a.btn{text-decoration:none}
   display:flex;
   gap:10px;
   flex-wrap:wrap;
+}
+
+@media (max-width: 720px){
+  .account{
+    grid-template-columns: 22px 1fr 36px 36px;
+  }
+  .accountHealth,
+  .account .miniInput{
+    grid-column: 2 / -1;
+  }
 }

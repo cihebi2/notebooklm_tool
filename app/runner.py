@@ -12,6 +12,7 @@ from notebooklm import AudioFormat, AudioLength, NotebookLMClient, RPCError
 from notebooklm.types import GenerationStatus
 
 from .accounts_store import AccountsStore
+from .notebooklm_health import no_task_id_failure_details
 from .utils.audio_concat import concat_audio, concat_audio_with_transitions
 from .utils.audio_duration import get_audio_duration
 from .utils.silence_detect import detect_silence_segments, segments_to_payload
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
+NOTEBOOKLM_KEEPALIVE_SECONDS = 300.0
 
 
 def _now_iso() -> str:
@@ -297,7 +299,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
     audio_format = _parse_audio_format(cfg.audio_format)
     language = cfg.language.strip() or "en"
     instructions = (cfg.instructions or "").strip() or None
-    per_account_concurrency = max(1, int(getattr(cfg, "per_account_concurrency", 2) or 2))
+    per_account_concurrency = max(1, int(getattr(cfg, "per_account_concurrency", 1) or 1))
     delete_cancelled_artifacts = bool(getattr(cfg, "delete_cancelled_artifacts", True))
 
     semaphore = asyncio.Semaphore(cfg.accounts_concurrency)
@@ -633,7 +635,11 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                     )
 
                     try:
-                        async with await NotebookLMClient.from_storage(account.storage_path, timeout=90.0) as client:
+                        async with await NotebookLMClient.from_storage(
+                            account.storage_path,
+                            timeout=90.0,
+                            keepalive=NOTEBOOKLM_KEEPALIVE_SECONDS,
+                        ) as client:
                             nb_title = _sanitize_filename(
                                 f"Morning Podcast - {job.id} - ep{episode_index:02d} - {account.name}"
                             )
@@ -811,6 +817,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                 )
                                             task_id = getattr(status, "task_id", None) or ""
                                             if not task_id:
+                                                failure_details = no_task_id_failure_details(status)
                                                 await publish(
                                                     {
                                                         "type": "part_generation_failed",
@@ -821,9 +828,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                         "part": part.index,
                                                         "attempt": attempt,
                                                         "episode": episode_index,
-                                                        "task_id": "",
-                                                        "error": "generate_audio returned empty task id",
-                                                        "error_code": "NO_TASK_ID",
+                                                        **failure_details,
                                                     }
                                                 )
                                                 return {"ok": False, "no_task_id": True, "attempt": attempt}
@@ -1518,7 +1523,11 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             )
 
             try:
-                async with await NotebookLMClient.from_storage(account.storage_path, timeout=90.0) as client:
+                async with await NotebookLMClient.from_storage(
+                    account.storage_path,
+                    timeout=90.0,
+                    keepalive=NOTEBOOKLM_KEEPALIVE_SECONDS,
+                ) as client:
                     nb_title = _sanitize_filename(f"Morning Podcast • {job.id} • {account.name}")
                     nb = await client.notebooks.create(nb_title)
                     await publish(
@@ -1735,6 +1744,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                         )
                                     task_id = getattr(status, "task_id", None) or ""
                                     if not task_id:
+                                        failure_details = no_task_id_failure_details(status)
                                         await publish(
                                             {
                                                 "type": "part_generation_failed",
@@ -1743,9 +1753,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                                 "notebook_id": nb.id,
                                                 "part": part.index,
                                                 "attempt": attempt,
-                                                "task_id": "",
-                                                "error": "generate_audio returned empty task id",
-                                                "error_code": "NO_TASK_ID",
+                                                **failure_details,
                                             }
                                         )
                                         return None
@@ -2402,6 +2410,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                 )
                             task_id = getattr(status, "task_id", None) or ""
                             if not task_id:
+                                failure_details = no_task_id_failure_details(status)
                                 await publish(
                                     {
                                         "type": "generation_failed",
@@ -2409,9 +2418,7 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                                         "account_id": account.id,
                                         "notebook_id": nb.id,
                                         "attempt": attempt,
-                                        "task_id": "",
-                                        "error": "generate_audio returned empty task id",
-                                        "error_code": "NO_TASK_ID",
+                                        **failure_details,
                                     }
                                 )
                                 return None

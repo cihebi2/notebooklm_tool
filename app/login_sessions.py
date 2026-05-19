@@ -178,6 +178,10 @@ class LoginSessionManager:
 
         if profile_id:
             parsed_browser, parsed_profile_dir = parse_profile_id(profile_id)
+            if parsed_browser == "firefox":
+                raise RuntimeError(
+                    "Firefox Profile 仅支持离线导入 Cookie；浏览器登录添加请使用 Edge、Chrome 或 Playwright Chromium。"
+                )
             chosen_browser = parsed_browser
             chosen_profile_id = f"{parsed_browser}:{parsed_profile_dir}"
             profile_mode = "system"
@@ -439,4 +443,3 @@ class LoginSessionManager:
             shutil.rmtree(session.session_dir, ignore_errors=True)
         except Exception:
             pass
-

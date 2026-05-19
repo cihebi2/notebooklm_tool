@@ -13,6 +13,7 @@
 - 设置：目标音频条数、语言、长度（LONG/DEFAULT/SHORT）、风格、提示词
 - 后台自动轮询生成 → 下载 → 读取音频时长 → 达标即保留
 - 页面实时显示日志与下载列表
+- 账号池健康检查：区分授权失效、额度/风控、网络异常和疑似 NotebookLM 私有接口变化
 - 分段音频可插入「过渡音频」（可设置淡入淡出、重复次数、时长）
 - 内置独立的拼接页面 `/concat`，支持片头/片尾/片尾曲拼接
 - 内置独立的报告解说页面 `/report-explain`：支持多 PDF 并行处理、可选仅输出排版文字，调用 `codex exec --full-auto -c model_reasoning_effort="xhigh" -m gpt-5.4`
@@ -38,12 +39,12 @@ python -m venv .venv
 
 ## 准备多个账号的 storage_state.json
 
-你可以在网页「账号池」里直接用 **“浏览器登录添加”** 自动生成 `storage_state.json`（会弹出 Chromium 窗口），也可以用 CLI 手动生成后上传。
+你可以在网页「账号池」里直接用 **“浏览器登录添加”** 自动生成 `storage_state.json`（推荐，会弹出 Edge/Chrome/Chromium 窗口），也可以用 CLI 手动生成后上传。
 
 方式 A（推荐）：用 `notebooklm-py` 的 CLI 登录一次导出
 
 ```powershell
-.\.venv\Scripts\pip install "notebooklm-py[browser]==0.2.1"
+.\.venv\Scripts\pip install "notebooklm-py[browser]==0.4.1"
 .\.venv\Scripts\playwright install chromium
 
 # 每个账号执行一次，并指定不同的输出路径
@@ -56,6 +57,12 @@ python -m venv .venv
 
 - 账号：`data/accounts/<account_id>/storage_state.json`
 - 任务输出：`data/jobs/<job_id>/outputs/*.mp4`
+
+## 授权与并发建议
+
+- 默认账号并发为 `2`，单账号并行生成数为 `1`，避免过快触发 NotebookLM/Google 的额度或风控。
+- 如果账号池提示“授权失效”，说明本地 `storage_state.json` 已无法通过 Google 服务端校验；请优先重新用浏览器登录添加。离线 Cookie 导入只作为兜底：Windows 上 Firefox Profile 通常更稳定，Edge/Chrome 可能因 App-Bound/v20/DBSC 加密导致 Cookie 不完整。
+- `NO_TASK_ID` 日志会优先透传 NotebookLM 上游返回的 `error` / `error_code`；如果只看到本地 `NO_TASK_ID`，说明上游没有给出更具体原因。
 
 ## 文件命名规则（新版）
 

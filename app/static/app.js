@@ -3,6 +3,7 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 const state = {
   accounts: [],
+  accountHealth: {},
   browserProfiles: [],
   jobs: [],
   job: null,
@@ -36,6 +37,8 @@ const STORAGE_THEME = "notebooklm.uiTheme";
 const THEME_DARK = "dark";
 const THEME_LIGHT = "light";
 const STALL_WARNING_MS = 20 * 60 * 1000;
+const DEFAULT_ACCOUNTS_CONCURRENCY = 2;
+const DEFAULT_PER_ACCOUNT_CONCURRENCY = 1;
 const DEFAULT_TRANSITIONS_BY_SEGMENTS = {
   3: [
     "assets/transitions/第一二段之间的链接-轻快活泼自由自在尤克里里.wav",
@@ -167,8 +170,8 @@ function collectLastRunConfig(){
     language: $("#lang")?.value || "zh",
     audio_length: $("#audioLength")?.value || "long",
     audio_format: $("#audioFormat")?.value || "deep_dive",
-    accounts_concurrency: parseInt($("#accConcurrency")?.value || "4",10),
-    per_account_concurrency: parseInt($("#perAccConcurrency")?.value || "2",10),
+    accounts_concurrency: parseInt($("#accConcurrency")?.value || String(DEFAULT_ACCOUNTS_CONCURRENCY),10),
+    per_account_concurrency: parseInt($("#perAccConcurrency")?.value || String(DEFAULT_PER_ACCOUNT_CONCURRENCY),10),
     keep_short_files: !!$("#keepShort")?.checked,
     delete_short_artifacts: !!$("#deleteShort")?.checked,
     silence_check_enabled: !!$("#silenceCheckEnabled")?.checked,
@@ -1392,6 +1395,10 @@ async function loadJob(jobId, opts={}){
 async function refreshAccounts(){
   const res = await fetch("/api/accounts");
   state.accounts = await res.json();
+  const ids = new Set((state.accounts || []).map(a => a.id));
+  for (const id of Object.keys(state.accountHealth || {})){
+    if (!ids.has(id)) delete state.accountHealth[id];
+  }
   renderAccounts();
 }
 
@@ -1399,7 +1406,16 @@ function _browserLabel(v){
   const b = String(v || "").toLowerCase();
   if (b === "edge" || b === "msedge") return "Edge";
   if (b === "chrome") return "Chrome";
+  if (b === "firefox") return "Firefox";
   return "Chromium";
+}
+
+function _profileOptionLabel(p, includeBrowser = false){
+  const name = p?.display_name || p?.profile_dir || p?.id || "Profile";
+  const email = p?.user_name ? ` · ${p.user_name}` : "";
+  const dir = p?.profile_dir ? ` (${p.profile_dir})` : "";
+  const prefix = includeBrowser ? `${_browserLabel(p?.browser)} · ` : "";
+  return `${prefix}${name}${email}${dir}`;
 }
 
 function renderLoginProfiles(){
@@ -1420,14 +1436,44 @@ function renderLoginProfiles(){
   for (const p of profiles){
     const opt = document.createElement("option");
     opt.value = p.id;
-    const name = p.display_name || p.profile_dir || p.id;
-    const email = p.user_name ? ` · ${p.user_name}` : "";
-    const dir = p.profile_dir ? ` (${p.profile_dir})` : "";
-    opt.textContent = `${name}${email}${dir}`;
+    opt.textContent = _profileOptionLabel(p);
     profileSel.append(opt);
   }
 
   // best-effort restore selection
+  if (prev && Array.from(profileSel.options).some(o => o.value === prev)){
+    profileSel.value = prev;
+  }
+}
+
+function renderImportProfiles(){
+  const profileSel = $("#importProfile");
+  if (!profileSel) return;
+
+  const prev = profileSel.value;
+  profileSel.innerHTML = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "选择 Firefox / Edge / Chrome Profile";
+  profileSel.append(none);
+
+  const browserRank = {firefox: 0, edge: 1, chrome: 2};
+  const profiles = [...(state.browserProfiles || [])].sort((a, b) => {
+    const ab = String(a?.browser || "").toLowerCase();
+    const bb = String(b?.browser || "").toLowerCase();
+    const ar = browserRank[ab] ?? 9;
+    const br = browserRank[bb] ?? 9;
+    if (ar !== br) return ar - br;
+    return _profileOptionLabel(a).localeCompare(_profileOptionLabel(b), "zh-Hans");
+  });
+
+  for (const p of profiles){
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = _profileOptionLabel(p, true);
+    profileSel.append(opt);
+  }
+
   if (prev && Array.from(profileSel.options).some(o => o.value === prev)){
     profileSel.value = prev;
   }
@@ -1440,6 +1486,7 @@ async function refreshBrowserProfiles(){
     const list = await res.json();
     state.browserProfiles = Array.isArray(list) ? list : [];
     renderLoginProfiles();
+    renderImportProfiles();
   }catch{}
 }
 
@@ -1513,6 +1560,107 @@ async function initLoginSession(){
   }catch{}
 }
 
+function accountHealthClass(health){
+  if (!health) return "unknown";
+  if (health.pending) return "checking";
+  if (health.ok) return "good";
+  if (health.expired || health.category === "AUTH_EXPIRED") return "bad";
+  if (health.category === "RATE_LIMITED" || health.category === "NETWORK") return "warn";
+  return "bad";
+}
+
+function accountHealthLabel(health){
+  if (!health) return "未检查";
+  if (health.pending) return "检查中";
+  if (health.ok) return `正常 · ${health.notebooks ?? 0} notebooks`;
+  if (health.expired || health.category === "AUTH_EXPIRED") return "授权失效";
+  if (health.category === "RATE_LIMITED") return "额度/风控";
+  if (health.category === "API_CHANGED") return "接口疑似变化";
+  if (health.category === "NETWORK") return "网络异常";
+  return health.category || "异常";
+}
+
+function accountHealthTitle(health){
+  if (!health) return "尚未检查 NotebookLM 授权。";
+  const parts = [];
+  if (health.message) parts.push(health.message);
+  if (health.hint) parts.push(health.hint);
+  return parts.join("\n") || accountHealthLabel(health);
+}
+
+async function runAccountHealth(account, button=null){
+  if (!account?.id) return null;
+  if (button) button.disabled = true;
+  state.accountHealth[account.id] = {pending:true, message:"正在检查 NotebookLM 授权..."};
+  renderAccounts();
+  try{
+    const res = await fetch(`/api/accounts/${encodeURIComponent(account.id)}/health`, {method:"POST"});
+    let payload = null;
+    try{ payload = await res.json(); }catch{}
+    const data = payload?.detail || payload || {
+      ok: false,
+      category: "UNKNOWN",
+      message: await res.text(),
+      hint: "健康检查接口没有返回 JSON。"
+    };
+    if (!res.ok && data.ok !== false) data.ok = false;
+    state.accountHealth[account.id] = data;
+    renderAccounts();
+    if (data.ok){
+      alert(`健康检查通过：${account.name}\nnotebooks=${data.notebooks ?? "?"}`);
+    }else{
+      alert(`健康检查失败：${account.name}\n${data.message || data.category || "未知错误"}\n\n${data.hint || ""}`);
+    }
+    return data;
+  }catch(e){
+    const data = {
+      ok: false,
+      category: "NETWORK",
+      expired: false,
+      message: String(e),
+      hint: "本地健康检查请求失败，请确认服务仍在运行。",
+    };
+    state.accountHealth[account.id] = data;
+    renderAccounts();
+    alert(`健康检查失败：${account.name}\n${data.message}`);
+    return data;
+  }finally{
+    if (button) button.disabled = false;
+  }
+}
+
+async function checkAllAccountsHealth(){
+  if (!state.accounts.length) return alert("还没有账号可检查。");
+  const btn = $("#checkAccountsBtn");
+  if (btn) btn.disabled = true;
+  for (const account of state.accounts){
+    state.accountHealth[account.id] = {pending:true, message:"正在检查 NotebookLM 授权..."};
+  }
+  renderAccounts();
+  try{
+    const res = await fetch("/api/accounts/health");
+    let payload = null;
+    try{ payload = await res.json(); }catch{}
+    if (!res.ok || !Array.isArray(payload)){
+      throw new Error((payload?.detail && JSON.stringify(payload.detail)) || await res.text());
+    }
+    for (const item of payload){
+      if (item?.account_id) state.accountHealth[item.account_id] = item;
+    }
+    renderAccounts();
+    const bad = payload.filter(x => !x?.ok);
+    if (bad.length){
+      alert(`健康检查完成：${bad.length}/${payload.length} 个账号异常。\n请查看账号池里的“授权失效/额度/接口”提示。`);
+    }else{
+      alert(`健康检查完成：${payload.length} 个账号均可访问 NotebookLM。`);
+    }
+  }catch(e){
+    alert(`批量健康检查失败：${String(e)}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
 function renderAccounts(){
   const list = $("#accountsList");
   list.innerHTML = "";
@@ -1525,6 +1673,10 @@ function renderAccounts(){
   for (const a of state.accounts){
     const row = document.createElement("div");
     row.className = "account";
+    const healthState = state.accountHealth[a.id];
+    if (healthState && !healthState.ok && !healthState.pending){
+      row.classList.add("hasIssue");
+    }
 
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
@@ -1533,7 +1685,16 @@ function renderAccounts(){
 
     const name = document.createElement("div");
     name.className = "name";
-    name.innerHTML = `<strong>${a.name}</strong><small>${a.id}</small>`;
+    const strong = document.createElement("strong");
+    strong.textContent = a.name;
+    const small = document.createElement("small");
+    small.textContent = a.id;
+    name.append(strong, small);
+
+    const health = document.createElement("div");
+    health.className = `accountHealth ${accountHealthClass(healthState)}`;
+    health.textContent = accountHealthLabel(healthState);
+    health.title = accountHealthTitle(healthState);
 
     const attempts = document.createElement("input");
     attempts.className = "miniInput";
@@ -1556,27 +1717,11 @@ function renderAccounts(){
 
     const verify = document.createElement("button");
     verify.className = "iconBtn";
-    verify.title = "验证账号可用性";
-    verify.textContent = "✓";
-    verify.addEventListener("click", async () => {
-      verify.disabled = true;
-      try{
-        const res = await fetch(`/api/accounts/${a.id}/verify`, {method:"POST"});
-        if (!res.ok){
-          let detail = null;
-          try{ detail = (await res.json())?.detail; }catch{}
-          throw new Error(detail || await res.text());
-        }
-        const data = await res.json();
-        alert(`验证成功：账号「${a.name}」可以访问 NotebookLM（notebooks=${data.notebooks}）`);
-      }catch(e){
-        alert(`验证失败：${String(e)}`);
-      }finally{
-        verify.disabled = false;
-      }
-    });
+    verify.title = "健康检查：确认 NotebookLM 授权是否仍可用";
+    verify.textContent = "查";
+    verify.addEventListener("click", () => runAccountHealth(a, verify));
 
-    row.append(checkbox, name, attempts, verify, del);
+    row.append(checkbox, name, health, attempts, verify, del);
     list.append(row);
   }
 }
@@ -3065,8 +3210,8 @@ function collectConfig(){
       const raw = fixedEnabled ? mergeText(fixed, extra) : String(extra || "").trim();
       return applyDateTokens(raw);
     })(),
-    per_account_concurrency: parseInt($("#perAccConcurrency").value || "2",10),
-    accounts_concurrency: parseInt($("#accConcurrency").value || "4",10),
+    per_account_concurrency: parseInt($("#perAccConcurrency").value || String(DEFAULT_PER_ACCOUNT_CONCURRENCY),10),
+    accounts_concurrency: parseInt($("#accConcurrency").value || String(DEFAULT_ACCOUNTS_CONCURRENCY),10),
     silence_check_enabled: !!$("#silenceCheckEnabled")?.checked,
     silence_min_duration_s: parseFloat($("#silenceMinSeconds")?.value || "5"),
     silence_threshold_db: parseFloat($("#silenceThreshold")?.value || "-50"),
@@ -3339,12 +3484,12 @@ async function addAccount(){
   await refreshAccounts();
 }
 
-function maybeAutofillAccountNameFromProfile(){
+function maybeAutofillAccountNameFromProfile(event){
   const input = $("#accName");
-  const sel = $("#loginProfile");
-  if (!input || !sel) return;
+  if (!input) return;
   if ((input.value || "").trim()) return;
-  const id = String(sel.value || "");
+  const source = event?.target?.value ? event.target : ($("#loginProfile")?.value ? $("#loginProfile") : $("#importProfile"));
+  const id = String(source?.value || "");
   if (!id) return;
   const p = (state.browserProfiles || []).find(x => x?.id === id);
   const suggested = (p?.user_name || p?.display_name || "").trim();
@@ -3354,8 +3499,8 @@ function maybeAutofillAccountNameFromProfile(){
 async function importFromBrowserProfile(){
   const name = $("#accName").value.trim();
   if (!name) return alert("请输入账号名称（例如：Gemini-01）");
-  const profile_id = $("#loginProfile")?.value || "";
-  if (!profile_id) return alert("请选择一个已登录的 Edge/Chrome Profile（下拉框里带邮箱的那个）");
+  const profile_id = $("#importProfile")?.value || "";
+  if (!profile_id) return alert("请选择一个已登录的 Firefox / Edge / Chrome Profile；离线导入优先选 Firefox。");
 
   const btn = $("#importAccBtn");
   if (btn) btn.disabled = true;
@@ -3483,6 +3628,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("#cancelBtn").addEventListener("click", cancelJob);
   $("#stopAndStitchBtn")?.addEventListener("click", stopAndStitch);
   $("#refreshJobsBtn")?.addEventListener("click", refreshJobs);
+  $("#checkAccountsBtn")?.addEventListener("click", checkAllAccountsHealth);
   $("#savePromptBtn")?.addEventListener("click", saveFixedPrompt);
   $("#loadPromptBtn")?.addEventListener("click", () => loadFixedPrompt({fallbackToDefault:false}));
   $("#resetPromptBtn")?.addEventListener("click", resetFixedPrompt);
@@ -3506,6 +3652,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("#loginCancelBtn").addEventListener("click", cancelBrowserLogin);
   $("#loginBrowser")?.addEventListener("change", renderLoginProfiles);
   $("#loginProfile")?.addEventListener("change", maybeAutofillAccountNameFromProfile);
+  $("#importProfile")?.addEventListener("change", maybeAutofillAccountNameFromProfile);
 
   $("#cancelBtn").disabled = true;
   setJobStats(null);

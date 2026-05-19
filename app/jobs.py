@@ -48,8 +48,8 @@ class JobConfig(BaseModel):
     audio_format: str = Field(default="deep_dive")  # deep_dive|brief|critique|debate
     instructions: str = Field(default="")
 
-    per_account_concurrency: int = Field(ge=1, le=6, default=2)
-    accounts_concurrency: int = Field(ge=1, le=20, default=4)
+    per_account_concurrency: int = Field(ge=1, le=6, default=1)
+    accounts_concurrency: int = Field(ge=1, le=20, default=2)
 
     keep_short_files: bool = False
     delete_short_artifacts: bool = True

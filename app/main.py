@@ -18,6 +18,7 @@ from .accounts_store import AccountsStore
 from .concat_service import ConcatService
 from .config import get_paths
 from .jobs import JobConfig, JobManager
+from .notebooklm_health import check_account_health
 from .report_explain_service import ReportExplainService
 from .utils.audio_concat import concat_audio, concat_audio_with_transitions
 from .utils.audio_duration import get_audio_duration
@@ -134,20 +135,33 @@ async def verify_account(account_id: str) -> dict[str, Any]:
     if not account:
         raise HTTPException(status_code=404, detail="account not found")
 
-    from notebooklm import NotebookLMClient
+    result = await check_account_health(account)
+    if result.get("ok"):
+        return result
+    raise HTTPException(status_code=400, detail=result)
 
-    try:
-        async with await NotebookLMClient.from_storage(account.storage_path) as client:
-            notebooks = await client.notebooks.list()
-        return {"ok": True, "account_id": account_id, "notebooks": len(notebooks)}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+
+@app.post("/api/accounts/{account_id}/health")
+async def check_account(account_id: str) -> dict[str, Any]:
+    account = accounts_store.get(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="account not found")
+    return await check_account_health(account)
+
+
+@app.get("/api/accounts/health")
+async def check_accounts() -> list[dict[str, Any]]:
+    # Run sequentially to avoid turning a health check into a rate-limit trigger.
+    results: list[dict[str, Any]] = []
+    for account in accounts_store.list():
+        results.append(await check_account_health(account))
+    return results
 
 
 class StartLoginRequest(BaseModel):
     name: str
     browser: str | None = None  # chromium | edge | chrome
-    profile_id: str | None = None  # e.g. "edge:Default" / "chrome:Profile 1"
+    profile_id: str | None = None  # browser login only supports Edge/Chrome profile reuse
 
 
 class ImportFromProfileRequest(BaseModel):
