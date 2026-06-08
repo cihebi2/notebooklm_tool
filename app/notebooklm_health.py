@@ -51,7 +51,7 @@ def classify_notebooklm_error(exc: BaseException | str) -> dict[str, Any]:
     ):
         category = "AUTH_EXPIRED"
         expired = True
-        hint = "账号授权已失效：请重新授权，用浏览器登录添加，或从当前已登录的 Edge/Chrome Profile 重新导入。"
+        hint = "账号授权已失效：新浏览器登录账号会先尝试从保存的浏览器 Profile 恢复；仍失败时请重新授权，用浏览器登录添加。"
     elif "csrf token not found" in lower or "session id not found" in lower:
         category = "TOKEN_EXTRACT_FAILED"
         hint = "NotebookLM 页面 token 提取失败：可能是授权失效，也可能是页面结构变化；先重新授权，再考虑升级 notebooklm-py。"
@@ -112,7 +112,7 @@ async def check_account_health(account: Any, *, timeout: float = 30.0) -> dict[s
         "checked_at": checked_at,
     }
 
-    try:
+    async def _check_once() -> dict[str, Any]:
         from notebooklm import NotebookLMClient
 
         async with await NotebookLMClient.from_storage(
@@ -128,8 +128,36 @@ async def check_account_health(account: Any, *, timeout: float = 30.0) -> dict[s
             "message": "NotebookLM auth is healthy.",
             "hint": "账号可访问 NotebookLM。",
         }
+
+    try:
+        return await _check_once()
     except Exception as exc:
+        has_recovery_source = bool(
+            getattr(account, "browser_profile_path", None) or getattr(account, "profile_id", None)
+        )
         detail = classify_notebooklm_error(exc)
+        if has_recovery_source and detail.get("expired"):
+            try:
+                from .account_keepalive import refresh_account_cookies
+
+                recovery = await refresh_account_cookies(account)
+                if recovery.ok:
+                    recovered = await _check_once()
+                    return {
+                        **recovered,
+                        "recovered": True,
+                        "recovery_message": recovery.message,
+                    }
+                detail["message"] = f"{detail.get('message')} | profile recovery failed: {recovery.message}"
+                detail["recovered"] = False
+            except Exception as recovery_exc:  # noqa: BLE001 - health should return structured failure.
+                detail["message"] = (
+                    f"{detail.get('message')} | profile recovery failed: "
+                    f"{type(recovery_exc).__name__}: {recovery_exc}"
+                )
+                detail["recovered"] = False
+        else:
+            detail = classify_notebooklm_error(exc)
         return {
             **base,
             "ok": False,

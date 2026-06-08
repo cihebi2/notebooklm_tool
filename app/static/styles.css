@@ -402,7 +402,7 @@ a.btn{text-decoration:none}
   padding:12px 12px;
   background: rgba(0,0,0,.16);
   display:grid;
-  grid-template-columns: 22px 1fr 128px 120px 36px 36px;
+  grid-template-columns: 22px 1fr 128px 120px 36px 36px 36px;
   align-items:center;
   gap:10px;
 }
@@ -950,7 +950,7 @@ a.btn{text-decoration:none}
 
 @media (max-width: 720px){
   .account{
-    grid-template-columns: 22px 1fr 36px 36px;
+    grid-template-columns: 22px 1fr 36px 36px 36px;
   }
   .accountHealth,
   .account .miniInput{

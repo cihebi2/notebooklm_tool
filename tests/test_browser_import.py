@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app.accounts_store import AccountsStore
+from app.config import AppPaths
 from app.login_sessions import LoginSessionManager
 from app.utils.browser_cookies import export_storage_state_from_profile_id
 from app.utils.browser_profiles import list_browser_profiles, parse_profile_id
@@ -75,6 +77,60 @@ class BrowserImportTests(unittest.TestCase):
             manager = LoginSessionManager(Path(td) / "sessions")
             with self.assertRaisesRegex(RuntimeError, "Firefox Profile"):
                 asyncio.run(manager.start("FF", profile_id="firefox:abc.default-release"))
+
+    def test_account_store_persists_bound_profile(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            paths = AppPaths(
+                base_dir=base,
+                data_dir=base / "data",
+                accounts_dir=base / "data" / "accounts",
+                jobs_dir=base / "data" / "jobs",
+            )
+            paths.accounts_dir.mkdir(parents=True)
+            store = AccountsStore(paths)
+            account = store.add(
+                "A",
+                b'{"cookies":[{"name":"SID","value":"x","domain":".google.com"}],"origins":[]}',
+                "2026-01-01T00:00:00+00:00",
+                profile_id="firefox:abc.default-release",
+            )
+
+            loaded = AccountsStore(paths).get(account.id)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.profile_id, "firefox:abc.default-release")
+
+            updated = store.set_profile_id(account.id, "edge:Default")
+            self.assertIsNotNone(updated)
+            self.assertEqual(AccountsStore(paths).get(account.id).profile_id, "edge:Default")
+
+    def test_account_store_moves_saved_browser_profile(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            paths = AppPaths(
+                base_dir=base,
+                data_dir=base / "data",
+                accounts_dir=base / "data" / "accounts",
+                jobs_dir=base / "data" / "jobs",
+            )
+            paths.accounts_dir.mkdir(parents=True)
+            source_profile = base / "session" / "browser_profile"
+            source_profile.mkdir(parents=True)
+            (source_profile / "marker.txt").write_text("ok", encoding="utf-8")
+
+            account = AccountsStore(paths).add(
+                "A",
+                b'{"cookies":[{"name":"SID","value":"x","domain":".google.com"}],"origins":[]}',
+                "2026-01-01T00:00:00+00:00",
+                browser_profile_source=source_profile,
+                browser="edge",
+            )
+
+            self.assertFalse(source_profile.exists())
+            self.assertIsNotNone(account.browser_profile_path)
+            saved_profile = Path(account.browser_profile_path)
+            self.assertTrue((saved_profile / "marker.txt").exists())
+            self.assertEqual(account.browser, "edge")
 
 
 if __name__ == "__main__":

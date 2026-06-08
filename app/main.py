@@ -5,6 +5,7 @@ import json
 import subprocess
 import uuid
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .accounts_store import AccountsStore
+from .account_keepalive import AccountKeepaliveService
 from .concat_service import ConcatService
 from .config import get_paths
 from .jobs import JobConfig, JobManager
@@ -35,13 +37,25 @@ paths.jobs_dir.mkdir(parents=True, exist_ok=True)
 accounts_store = AccountsStore(paths)
 job_manager = JobManager(paths, accounts_store)
 login_manager = LoginSessionManager(paths.data_dir / "login_sessions")
+account_keepalive = AccountKeepaliveService(accounts_store)
 prompts_path = paths.data_dir / "prompts.json"
 concat_service = ConcatService(paths)
 report_explain_service = ReportExplainService(paths)
 default_prompts_path = paths.base_dir / "assets" / "prompts.default.json"
 default_report_explain_prompt_path = paths.base_dir / "报告解说提示词.txt"
 
-app = FastAPI(title="Podcast Studio (NotebookLM)")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Do not run periodic cookie keepalive on startup. Auth recovery is handled
+    # on demand from the account-owned browser profile saved during login.
+    try:
+        yield
+    finally:
+        await account_keepalive.stop()
+
+
+app = FastAPI(title="Podcast Studio (NotebookLM)", lifespan=lifespan)
 
 static_dir = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -113,11 +127,27 @@ async def list_accounts() -> list[dict[str, Any]]:
 async def add_account(
     name: str = Form(...),
     storage_state: UploadFile = File(...),
+    profile_id: str | None = Form(default=None),
 ) -> dict[str, Any]:
     raw = await storage_state.read()
     if len(raw) < 100:
         raise HTTPException(status_code=400, detail="storage_state.json seems too small")
-    account = accounts_store.add(name=name.strip(), storage_state_bytes=raw, created_at_iso=_now_iso())
+    clean_profile_id = (profile_id or "").strip() or None
+    if clean_profile_id:
+        from .utils.browser_profiles import parse_profile_id
+
+        try:
+            parse_profile_id(clean_profile_id)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        if not clean_profile_id.lower().startswith("firefox:"):
+            raise HTTPException(status_code=400, detail="Only Firefox Profile can be bound for automatic recovery")
+    account = accounts_store.add(
+        name=name.strip(),
+        storage_state_bytes=raw,
+        created_at_iso=_now_iso(),
+        profile_id=clean_profile_id,
+    )
     return account.__dict__
 
 
@@ -158,6 +188,33 @@ async def check_accounts() -> list[dict[str, Any]]:
     return results
 
 
+@app.get("/api/accounts/keepalive")
+async def get_accounts_keepalive() -> dict[str, Any]:
+    return account_keepalive.status()
+
+
+@app.post("/api/accounts/keepalive/run")
+async def run_accounts_keepalive() -> dict[str, Any]:
+    results = await account_keepalive.run_once()
+    return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
+
+
+@app.post("/api/accounts/recover/run")
+async def run_accounts_recovery() -> dict[str, Any]:
+    results = await account_keepalive.run_once()
+    return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
+
+
+@app.get("/api/accounts/keepalive/run")
+async def run_accounts_keepalive_hint() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "message": "Periodic keepalive is disabled. This endpoint requires POST for one-shot recovery. New browser-login accounts recover from their saved browser profile.",
+        "status_url": "/api/accounts/keepalive",
+        "powershell": "Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/accounts/recover/run",
+    }
+
+
 class StartLoginRequest(BaseModel):
     name: str
     browser: str | None = None  # chromium | edge | chrome
@@ -167,6 +224,10 @@ class StartLoginRequest(BaseModel):
 class ImportFromProfileRequest(BaseModel):
     name: str
     profile_id: str
+
+
+class AccountProfileRequest(BaseModel):
+    profile_id: str | None = None
 
 
 @app.get("/api/browser/profiles")
@@ -292,6 +353,7 @@ async def import_account_from_profile(req: ImportFromProfileRequest) -> dict[str
         name=req.name.strip(),
         storage_state_bytes=exported.storage_state_bytes,
         created_at_iso=_now_iso(),
+        profile_id=req.profile_id if req.profile_id.lower().startswith("firefox:") else None,
     )
     return {
         **account.__dict__,
@@ -302,7 +364,9 @@ async def import_account_from_profile(req: ImportFromProfileRequest) -> dict[str
 @app.post("/api/accounts/login/{session_id}/finish")
 async def finish_login(session_id: str, force: bool = False) -> dict[str, Any]:
     try:
-        name, raw = await login_manager.finish(session_id, force=force)
+        name, raw, profile_id, browser, profile_mode, user_data_dir = await login_manager.finish(
+            session_id, force=force
+        )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:
@@ -315,7 +379,37 @@ async def finish_login(session_id: str, force: bool = False) -> dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    account = accounts_store.add(name=name.strip(), storage_state_bytes=raw, created_at_iso=_now_iso())
+    try:
+        browser_profile_source = Path(user_data_dir) if profile_mode == "temp" and user_data_dir else None
+        account = accounts_store.add(
+            name=name.strip(),
+            storage_state_bytes=raw,
+            created_at_iso=_now_iso(),
+            profile_id=profile_id if profile_id and profile_id.lower().startswith("firefox:") else None,
+            browser_profile_source=browser_profile_source,
+            browser=browser,
+        )
+        return account.__dict__
+    finally:
+        await login_manager.cleanup_session(session_id)
+
+
+@app.post("/api/accounts/{account_id}/profile")
+async def bind_account_profile(account_id: str, req: AccountProfileRequest) -> dict[str, Any]:
+    profile_id = (req.profile_id or "").strip() or None
+    if profile_id:
+        from .utils.browser_profiles import parse_profile_id
+
+        try:
+            parse_profile_id(profile_id)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        if not profile_id.lower().startswith("firefox:"):
+            raise HTTPException(status_code=400, detail="Only Firefox Profile can be bound for automatic recovery")
+
+    account = accounts_store.set_profile_id(account_id, profile_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="account not found")
     return account.__dict__
 
 

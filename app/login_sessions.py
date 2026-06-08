@@ -374,12 +374,18 @@ class LoginSessionManager:
                 message=_friendly_launch_error(err) or "启动浏览器失败。",
             )
 
-    async def finish(self, session_id: str, force: bool = False) -> tuple[str, bytes]:
+    async def finish(
+        self, session_id: str, force: bool = False
+    ) -> tuple[str, bytes, str | None, str, str, str | None]:
         with self._lock:
             session = self._sessions.get(session_id)
             if not session:
                 raise KeyError("session not found")
             name = session.name
+            profile_id = session.profile_id
+            browser = session.browser
+            profile_mode = session.profile_mode
+            user_data_dir = session.user_data_dir
             storage_path = session.storage_path
             cmd_q = session._cmd_q
             t = session._thread
@@ -409,8 +415,9 @@ class LoginSessionManager:
         except Exception as e:
             raise RuntimeError(f"invalid storage_state.json: {e}") from e
 
-        await self._cleanup(session_id)
-        return name, raw
+        # Caller moves the temporary browser profile into the account directory,
+        # then calls cleanup_session() to remove the remaining session wrapper.
+        return name, raw, profile_id, browser, profile_mode, str(user_data_dir) if user_data_dir else None
 
     async def cancel(self, session_id: str) -> bool:
         with self._lock:
@@ -431,10 +438,10 @@ class LoginSessionManager:
                 pass
             await asyncio.to_thread(t.join, 10.0)
 
-        await self._cleanup(session_id)
+        await self.cleanup_session(session_id)
         return True
 
-    async def _cleanup(self, session_id: str) -> None:
+    async def cleanup_session(self, session_id: str) -> None:
         with self._lock:
             session = self._sessions.pop(session_id, None)
         if not session or not session.session_dir:

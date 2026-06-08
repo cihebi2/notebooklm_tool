@@ -1688,7 +1688,8 @@ function renderAccounts(){
     const strong = document.createElement("strong");
     strong.textContent = a.name;
     const small = document.createElement("small");
-    small.textContent = a.id;
+    const recovery = a.browser_profile_path ? `保存Profile: ${a.browser || "browser"}` : (a.profile_id ? `Profile: ${a.profile_id}` : "未绑定恢复源");
+    small.textContent = `${a.id} · ${recovery}`;
     name.append(strong, small);
 
     const health = document.createElement("div");
@@ -1721,7 +1722,29 @@ function renderAccounts(){
     verify.textContent = "查";
     verify.addEventListener("click", () => runAccountHealth(a, verify));
 
-    row.append(checkbox, name, health, attempts, verify, del);
+    const bind = document.createElement("button");
+    bind.className = "iconBtn";
+    bind.title = "绑定下面选择的浏览器 Profile；保活失败时会尝试从该 Profile 自动重建 Cookie";
+    bind.textContent = "绑";
+    bind.addEventListener("click", async () => {
+      const profile_id = $("#importProfile")?.value || $("#loginProfile")?.value || "";
+      if (!profile_id) return alert("请先在下方选择一个 Firefox / Edge / Chrome Profile。Firefox 通常最稳。");
+      if (!String(profile_id).toLowerCase().startsWith("firefox:")) return alert("自动恢复只绑定 Firefox Profile。请先安装/打开 Firefox，并登录对应 Google 账号。");
+      if (!confirm(`将账号「${a.name}」绑定到 Profile：\n${profile_id}\n\n后续保活失败时会尝试从这个 Profile 自动恢复 Cookie。继续吗？`)) return;
+      const res = await fetch(`/api/accounts/${encodeURIComponent(a.id)}/profile`, {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({profile_id})
+      });
+      if (!res.ok){
+        let detail = null;
+        try{ detail = (await res.json())?.detail; }catch{}
+        return alert(`绑定失败：${detail || await res.text()}`);
+      }
+      await refreshAccounts();
+    });
+
+    row.append(checkbox, name, health, attempts, bind, verify, del);
     list.append(row);
   }
 }
@@ -3477,6 +3500,8 @@ async function addAccount(){
   const fd = new FormData();
   fd.append("name", name);
   fd.append("storage_state", file, file.name);
+  const profile_id = $("#importProfile")?.value || "";
+  if (String(profile_id).toLowerCase().startsWith("firefox:")) fd.append("profile_id", profile_id);
   const res = await fetch("/api/accounts", {method:"POST", body: fd});
   if (!res.ok) return alert(await res.text());
   $("#accName").value = "";

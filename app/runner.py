@@ -12,6 +12,7 @@ from notebooklm import AudioFormat, AudioLength, NotebookLMClient, RPCError
 from notebooklm.types import GenerationStatus
 
 from .accounts_store import AccountsStore
+from .account_keepalive import refresh_account_cookies
 from .notebooklm_health import no_task_id_failure_details
 from .utils.audio_concat import concat_audio, concat_audio_with_transitions
 from .utils.audio_duration import get_audio_duration
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
-NOTEBOOKLM_KEEPALIVE_SECONDS = 300.0
+NOTEBOOKLM_KEEPALIVE_SECONDS = None
 
 
 def _now_iso() -> str:
@@ -635,6 +636,22 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
                     )
 
                     try:
+                        if getattr(account, "browser_profile_path", None) or getattr(account, "profile_id", None):
+                            auth_recovery = await refresh_account_cookies(account)
+                            await publish(
+                                {
+                                    "type": "account_auth_recovery",
+                                    "ts": _now_iso(),
+                                    "account_id": account.id,
+                                    "account_name": account.name,
+                                    "ok": auth_recovery.ok,
+                                    "message": auth_recovery.message,
+                                    "used_profile_recovery": auth_recovery.used_profile_recovery,
+                                    "episode": episode_index,
+                                }
+                            )
+                            if not auth_recovery.ok:
+                                raise RuntimeError(auth_recovery.message)
                         async with await NotebookLMClient.from_storage(
                             account.storage_path,
                             timeout=90.0,
@@ -1523,6 +1540,21 @@ async def run_job(job: Job, report_text: str, accounts_store: AccountsStore) -> 
             )
 
             try:
+                if getattr(account, "browser_profile_path", None) or getattr(account, "profile_id", None):
+                    auth_recovery = await refresh_account_cookies(account)
+                    await publish(
+                        {
+                            "type": "account_auth_recovery",
+                            "ts": _now_iso(),
+                            "account_id": account.id,
+                            "account_name": account.name,
+                            "ok": auth_recovery.ok,
+                            "message": auth_recovery.message,
+                            "used_profile_recovery": auth_recovery.used_profile_recovery,
+                        }
+                    )
+                    if not auth_recovery.ok:
+                        raise RuntimeError(auth_recovery.message)
                 async with await NotebookLMClient.from_storage(
                     account.storage_path,
                     timeout=90.0,
